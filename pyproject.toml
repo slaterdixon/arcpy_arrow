@@ -9,7 +9,6 @@ description = "Arrow-based helpers for moving data between ArcPy and dataframes"
 requires-python = ">=3.11"
 dependencies = [
     "pandas",
-    "polars",
     "geopandas",
     "pyarrow",
     "shapely",
@@ -17,6 +16,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+polars = ["polars"]
 dev = ["pytest"]
 
 [tool.setuptools.packages.find]
