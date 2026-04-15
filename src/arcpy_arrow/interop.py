@@ -289,7 +289,7 @@ def _sr_from_gdf(gdf: gpd.GeoDataFrame) -> arcpy.SpatialReference:
     return sr
 
 
-def df_to_fc(df: pl.DataFrame|pd.DataFrame|gpd.GeoDataFrame,
+def df_to_fc(df: "pl.DataFrame|pd.DataFrame|gpd.GeoDataFrame",
              fc: str|Path|ESRITable|None,
              mode: Literal["new", "overwrite", "append"] = "new",
              ) -> str:
