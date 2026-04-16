@@ -54,6 +54,7 @@ scripts/update_locator_data/GeocodeServiceDraftFiles/
 # Prototyping
 # In this house we don't put Jupyter notebooks into production
 *.ipynb
+!examples/*.ipynb
 *.R
 *.Rproj
 *.qmd
