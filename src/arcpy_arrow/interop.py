@@ -3,7 +3,7 @@ import warnings
 import pyarrow as pa
 from pathlib import Path
 from shapely import from_wkb
-from typing import Literal
+from typing import Literal, overload
 import pandas as pd
 from dataclasses import dataclass
 from functools import cached_property
@@ -25,8 +25,37 @@ _UINT_TO_SINT = {
 
 @dataclass
 class ESRITable:
+    """A lightweight reference to an ArcGIS feature class or table.
+
+    Stores the components needed to construct a catalog path and provides
+    convenience accessors for common ``arcpy.Describe`` properties and
+    Arrow-based I/O. ``arcpy`` calls are deferred until first access and
+    then cached, so constructing an ``ESRITable`` is cheap.
+
+    Args:
+        name: The feature class or table name (without workspace or dataset prefix).
+        workspace: Path to the geodatabase or folder workspace (e.g. a ``.gdb``
+            or ``.sde`` file).
+        dataset_name: Name of the containing feature dataset, if any.
+        schema_prefix: Prefix applied to both ``dataset_name`` and ``name`` when
+            building the catalog path — typically the ``<owner>.`` prefix used
+            in enterprise geodatabases (e.g. ``"GIS."``).
+
+    Examples:
+        ```
+        hydrants_fc = ESRITable(
+            name="hydrants",
+            workspace=Path("C:/connections/prod.sde"),
+            dataset_name="Water",
+            schema_prefix="sde.GIS.",
+        )
+        hydrants_fc.path  
+        # >> Path("C:/connections/prod.sde/sde.GIS.Water/sde.GIS.hydrants")
+        ```
+    """
+
     name: str
-    workspace: Path 
+    workspace: Path
     dataset_name: str | None = None
     schema_prefix : str = ""
 
@@ -53,6 +82,11 @@ class ESRITable:
 
     @cached_property
     def exists(self):
+        """Whether the feature class or table exists at :attr:`path`.
+
+        Cached on first access — will not reflect creation or deletion after
+        the first call. Invalidate by deleting the attribute: ``del tbl.exists``.
+        """
         return arcpy.Exists(str(self.path))
 
     ### Don't cache simple lookups
@@ -93,13 +127,27 @@ class ESRITable:
     def row_count(self):
         return int(arcpy.GetCount_management(str(self.path)).getOutput(0))
 
-
-
     def as_data_frame(self, 
                       field_names: list[str] | None = None, 
                       where_clause: str | None = None, 
                       df_type: Literal["pandas", "polars", "pyarrow"] = "pandas"
                       ) -> "pd.DataFrame|pl.DataFrame|pa.Table":
+        
+        """Fetch this table's attributes as a DataFrame (non-spatial).
+
+        Args:
+            field_names: Subset of fields to fetch. Fetches all fields if ``None``.
+            where_clause: SQL where clause to filter rows. No filter if ``None``.
+            df_type: Output type — ``"pandas"``, ``"polars"``, or ``"pyarrow"``.
+
+        Raises:
+            ValueError: One or more :attr:`field_names` are not present in the table.
+            ImportError: :attr:`df_type` is ``"polars"`` but polars is not installed.
+            TypeError: :attr:`df_type` is not one of the allowed values.
+
+        Returns:
+            A DataFrame of the requested type containing the table's attributes.
+        """
 
         return fc_to_df(fc = self,
                         field_names=field_names,
@@ -113,7 +161,26 @@ class ESRITable:
                     fallback_crs : int | None = None,
                     allow_null_geometries:bool = False,
                     to_crs:bool = False,
-                    ):
+                    ) -> gpd.GeoDataFrame:
+        
+        """Fetch this feature class as a GeoDataFrame with shapely geometries.
+
+        Args:
+            field_names: Subset of fields to fetch. Fetches all fields if ``None``.
+                The geometry column is always included.
+            where_clause: SQL where clause to filter rows. No filter if ``None``.
+            allow_null_geometries: If ``True``, warn on null/invalid geometries instead
+                of raising. Covers missing values and shapes unparseable by shapely.
+            fallback_crs: EPSG code to use when the feature class spatial reference
+                has no resolvable factory code (e.g. an improperly defined CRS).
+            to_crs: If provided, reproject the result to this EPSG code.
+
+        Raises:
+            ValueError: One or more :attr:`field_names` are not present in the feature class.
+
+        Returns:
+            A GeoDataFrame with the feature class attributes and shapely geometries.
+        """
 
         return fc_to_gdf(fc = self,
                          field_names=field_names,
@@ -144,30 +211,40 @@ class ESRITable:
 
 
 def memory_str() -> str:
-    """
-    Get a random in-memory string to write to using a universally unique identifier
-
-    :return: A string like "memory/fc_4af874bd5b654bb7914e4165e2667a19"
-    :rtype: str
-    """
+    """Return a unique ArcGIS in-memory path, e.g. ``"memory/fc_4af874bd5b654bb7914e4165e2667a19"``."""
     return f"memory/fc_{uuid4().hex}"
+
 
 def _sanitize_arr_tbl(table: pa.Table, 
                       shape_col:str | None  = None, 
                       sr:arcpy.SpatialReference | None = None
                       ) -> pa.Table:
-    """
-    Sanitize types in an Arrow table so it can be passed into arcpy functions
-    like arcpy.management.CopyRows(), arcpy.management.CopyFeatures(), arcpy.management.Append(), etc.
+    """Sanitize an Arrow table for use with ``arcpy.management.CopyRows()``, ``CopyFeatures()``, and ``Append()``.
 
-    You must explicitly pass a `shape_col` and `sr` for geometry encoding.
+    Normalises field types that arcpy cannot handle: upcasts unsigned integers,
+    collapses large strings and dictionary-encoded columns, normalises timestamps
+    to milliseconds, and attaches ESRI geometry metadata to the shape column.
+    Resets metadata on OBJECTID and drops unsupported binary columns.
 
-    This function drops existing metadata in OBJECTID, Binary columns
-    
-    :param table: The Arrow Table to be converted
-    :param sr: A spatial reference used to construct ESRI geometry metadata
-    :return: An arrow table with sanitized columns 
+    Args:
+        table: The Arrow table to sanitize.
+        shape_col: Name of the geometry column. Must be binary (WKB). If provided,
+            :attr:`sr` must also be supplied.
+        sr: Spatial reference used to build the ``esri.sr_wkt`` field metadata.
+
+    Raises:
+        TypeError: :attr:`table` is not a ``pa.Table``.
+        ValueError: :attr:`shape_col` is provided but :attr:`sr` is ``None``.
+        TypeError: :attr:`sr` is not an ``arcpy.SpatialReference``.
+        TypeError: :attr:`shape_col` column is not binary-like.
+        TypeError: A non-shape column has a binary-like type (unsupported).
+        RuntimeError: :attr:`shape_col` was specified but not found in the schema.
+
+    Returns:
+        A sanitized ``pa.Table`` ready to pass to arcpy write functions.
     """
+
+
     if not isinstance(table, pa.Table):
         raise TypeError("The passed table must be a pyarrow table")
     if sr is None and shape_col is not None: 
@@ -276,6 +353,21 @@ def _sanitize_arr_tbl(table: pa.Table,
 
 ### df -> fc
 def _sr_from_gdf(gdf: gpd.GeoDataFrame) -> arcpy.SpatialReference:
+    """Derive an ``arcpy.SpatialReference`` from a GeoDataFrame's CRS.
+
+    Prefers EPSG factory code; falls back to the projection's authority string
+    for CRS that have no clean EPSG code.
+
+    Args:
+        gdf: A GeoDataFrame with a defined CRS.
+
+    Raises:
+        ValueError: The GeoDataFrame has no CRS set.
+
+    Returns:
+        An ``arcpy.SpatialReference`` matching the GeoDataFrame's CRS.
+    """
+
     if gdf.crs is None:
         raise ValueError("GeoDataFrame has no CRS")
     
@@ -289,10 +381,32 @@ def _sr_from_gdf(gdf: gpd.GeoDataFrame) -> arcpy.SpatialReference:
     return sr
 
 
+@overload
+def df_to_fc(df: "pl.DataFrame|pd.DataFrame|gpd.GeoDataFrame", fc: ESRITable, mode: Literal["new", "overwrite", "append"] = ...) -> ESRITable: ...
+@overload
+def df_to_fc(df: "pl.DataFrame|pd.DataFrame|gpd.GeoDataFrame", fc: str|Path|None, mode: Literal["new", "overwrite", "append"] = ...) -> str: ...
 def df_to_fc(df: "pl.DataFrame|pd.DataFrame|gpd.GeoDataFrame",
              fc: str|Path|ESRITable|None,
              mode: Literal["new", "overwrite", "append"] = "new",
-             ) -> str:
+             ) -> str|ESRITable:
+    
+    """Write a DataFrame to an ArcGIS feature class or table.
+
+    Args:
+        df: A pandas DataFrame, GeoPandas GeoDataFrame, or Polars DataFrame.
+        fc: Destination path. Accepts a string, ``Path``, ``ESRITable``, or
+            ``None`` to write to a new in-memory workspace path.
+        mode: ``"new"`` creates the feature class (errors if it exists),
+            ``"overwrite"`` replaces it, ``"append"`` adds rows to an existing one.
+
+    Raises:
+        TypeError: :attr:`df` is not a supported DataFrame type.
+        FileNotFoundError: :attr:`mode` is ``"append"`` but :attr:`fc` does not exist.
+
+    Returns:
+        The path to the written feature class. Returns the original ``ESRITable``
+        when one is passed as :attr:`fc`, otherwise returns the path as a string.
+    """
 
     sr = None
     is_spatial = False
@@ -352,10 +466,16 @@ def df_to_fc(df: "pl.DataFrame|pd.DataFrame|gpd.GeoDataFrame",
             else:
                 arcpy.management.CopyRows(in_rows=df_san, out_table=fc_p)
 
+    if isinstance(fc, ESRITable):
+        return fc
     return fc_p
 
 
-def _resolve_fc (fc: str|Path|ESRITable):
+def _resolve_fc(fc: str|Path|ESRITable) -> tuple[bool, list[str], str]:
+    """
+    Get info needed to validate a fc. Helper for `fc_to_df()`
+    """
+
     if isinstance(fc, ESRITable):
         exists = fc.exists
         available_fields = fc.fields_names
@@ -373,6 +493,27 @@ def fc_to_df(fc: str|Path|ESRITable,
              where_clause: str | None = None,
              df_type: Literal["pandas", "polars", "pyarrow"] = "pandas",
             ) -> "pd.DataFrame|pl.DataFrame|pa.Table":
+    
+    """Fetch a table or feature class as a DataFrame (attributes only).
+
+    Wraps ``arcpy.da.TableToArrowTable()`` with field validation and existence
+    checks. For spatial data with usable geometries use ``fc_to_gdf()`` instead.
+
+    Args:
+        fc: The table or feature class to read.
+        field_names: Subset of fields to fetch. Fetches all fields if ``None``.
+        where_clause: SQL where clause to filter rows. No filter if ``None``.
+        df_type: Output type — ``"pandas"``, ``"polars"``, or ``"pyarrow"``.
+
+    Raises:
+        FileNotFoundError: :attr:`fc` does not exist.
+        ValueError: One or more :attr:`field_names` are not present in the table.
+        ImportError: :attr:`df_type` is ``"polars"`` but polars is not installed.
+        TypeError: :attr:`df_type` is not one of the allowed values.
+
+    Returns:
+        A DataFrame of the requested type containing the table's attributes.
+    """
 
 
     exists, available_fields, fc_p = _resolve_fc(fc)
@@ -408,6 +549,26 @@ def _load_gdf_from_arr(arr: pa.Table,
                        fallback_crs: int | None = None,
                        to_crs: int | None = None
                        ):
+    
+    """Build a GeoDataFrame from an Arrow table produced by ``arcpy.da.TableToArrowTable()``.
+
+    Args:
+        arr: Arrow table with a WKB geometry column.
+        sr: Spatial reference of the source feature class, used to set the CRS.
+        allow_null_geometries: If ``True``, warn on null/invalid geometries instead
+            of raising. Applies to both missing values and shapely parse failures.
+        shape_col: Name of the WKB geometry column in :attr:`arr`.
+        fallback_crs: EPSG code to use when :attr:`sr`.factoryCode is 0 (unresolvable).
+        to_crs: If provided, reproject the GeoDataFrame to this EPSG code after
+            construction.
+
+    Raises:
+        ValueError: Null geometries are present and :attr:`allow_null_geometries` is ``False``.
+        AttributeError: :attr:`sr`.factoryCode is 0 and no :attr:`fallback_crs` was given.
+
+    Returns:
+        A GeoDataFrame with shapely geometries and CRS set from :attr:`sr`.
+    """
     
     df = arr.to_pandas()
     
@@ -454,7 +615,28 @@ def fc_to_gdf(fc: str|Path|ESRITable,
              fallback_crs: int| None = None,
              to_crs: int | None = None
              ):
+    """Fetch a feature class as a GeoDataFrame with shapely geometries.
 
+    Args:
+        fc: The feature class to read.
+        field_names: Subset of fields to fetch. Fetches all fields if ``None``.
+            The geometry column is always included.
+        where_clause: SQL where clause to filter rows. No filter if ``None``.
+        allow_null_geometries: If ``True``, warn on null/invalid geometries instead
+            of raising. Covers missing values and shapes unparseable by shapely.
+        shape_col: Name of the geometry column. Auto-detected from :attr:`fc` when
+            an ``ESRITable`` is passed; defaults to ``"Shape"`` otherwise.
+        fallback_crs: EPSG code to use when the feature class spatial reference
+            has no resolvable factory code (e.g. an improperly defined CRS).
+        to_crs: If provided, reproject the result to this EPSG code.
+
+    Raises:
+        FileNotFoundError: :attr:`fc` does not exist.
+        ValueError: One or more :attr:`field_names` are not present in the feature class.
+
+    Returns:
+        A GeoDataFrame with the feature class attributes and shapely geometries.
+    """
 
     exists, available_fields, fc_p = _resolve_fc(fc) 
     if not exists:
