@@ -1,0 +1,30 @@
+package:
+  name: arcpy_arrow
+  version: 0.1.0
+
+source:
+  path: ..
+
+build:
+  number: 0
+  # --no-deps: all runtime deps (arcpy, pyarrow, pandas, geopandas, shapely)
+  # are provided by the ArcGIS Pro conda environment and must not be reinstalled.
+  script: "{{ PYTHON }} -m pip install --no-deps --ignore-installed -vv ."
+
+requirements:
+  host:
+    - python
+    - pip
+    - setuptools
+
+  run:
+    - python
+    # arcpy, pyarrow, pandas, geopandas, and shapely are intentionally omitted —
+    # they are expected to already be present in the ArcGIS Pro conda environment.
+
+test:
+  imports:
+    - arcpy_arrow
+
+about:
+  summary: Arrow-based helpers for moving data between ArcPy and dataframes
