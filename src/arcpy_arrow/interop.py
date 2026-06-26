@@ -5,10 +5,9 @@ import warnings
 import pyarrow as pa
 from pathlib import Path
 from shapely import from_wkb
-from typing import Literal, overload
+from typing import Literal
 import pandas as pd
 from dataclasses import dataclass
-from functools import cached_property
 import arcpy
 import geopandas as gpd
 
@@ -25,108 +24,157 @@ _UINT_TO_SINT = {
                 pa.uint64(): pa.int64(),
             }
 
+def memory_str() -> str:
+    """Return a unique ArcGIS in-memory path, e.g. ``"memory/fc_4af874bd5b654bb7914e4165e2667a19"``."""
+    return f"memory/fc_{uuid4().hex}"
+
+def _qualify_db_path(
+    name: str,
+    *,
+    db_conn: Path,
+    db_prefix: str,
+    dataset_name: str | None = None
+) -> Path:
+    """Fully-qualified SDE or FGDB catalog path, 
+    like ``C:/connections/vcitygisdb1_sde_gis.sde/sde.GIS.Address/sde.GIS.AddressPoints``
+    """
+
+    if dataset_name:
+        o = db_conn / f"{db_prefix}{dataset_name}" / f"{db_prefix}{name}"
+    else: 
+        o = db_conn / f"{db_prefix}{name}"
+
+    return o
+
+def _qualify_memory_path(name: str) -> str:
+    """In-memory workspace path. Idempotent if `name` already starts with 'memory/'."""
+    return name if name.startswith(("memory/", "memory\\")) else f"memory/{name}"
+
 @dataclass
-class ESRITable:
-    """A lightweight reference to an ArcGIS feature class or table.
+class CatalogPath:
+    """
+    arcpy represents catalog paths as strings. For fully-qualified enterprise geodatabase
+    paths, this means joining 
+        1. The .sde file
+        2. The db prefix
+        3. The dataset name, 
+        4. The table name.
 
-    Stores the components needed to construct a catalog path and provides
-    convenience accessors for common ``arcpy.Describe`` properties and
-    Arrow-based I/O. ``arcpy`` calls are deferred until first access and
-    then cached, so constructing an ``ESRITable`` is cheap.
+    To simplify this process CatalogPath parametizes each of these inputs, and resolves them as
+    a unified pathlib object, ``CatalogPath.path``, or string, ``str(CatalogPath)``.
+     
+    It also includes convenience functions for fetching metadata about the feature class
+    referenced by the CatalogPath, if it exists. 
 
-    Args:
-        name: The feature class or table name (without workspace or dataset prefix).
-        workspace: Path to the geodatabase or folder workspace (e.g. a ``.gdb``
-            or ``.sde`` file).
-        dataset_name: Name of the containing feature dataset, if any.
-        schema_prefix: Prefix applied to both ``dataset_name`` and ``name`` when
-            building the catalog path — typically the ``<owner>.`` prefix used
-            in enterprise geodatabases (e.g. ``"GIS."``).
-
-    Examples:
-        ```
-        hydrants_fc = ESRITable(
-            name="hydrants",
-            workspace=Path("C:/connections/prod.sde"),
-            dataset_name="Water",
-            schema_prefix="sde.GIS.",
-        )
-        hydrants_fc.path  
-        # >> Path("C:/connections/prod.sde/sde.GIS.Water/sde.GIS.hydrants")
-        ```
+    Memory and File Geodatabase workspaces are supported by accepting the default ``db_prefix = ''``
+    and passing the FDGDB path as a Path or "memory" 
     """
 
     name: str
-    workspace: Path
+    db_conn: Path | str 
+    db_prefix: str = ""
     dataset_name: str | None = None
-    schema_prefix : str = ""
 
+
+    ### Possible whether table exists or not
     @property
-    def path(self) -> Path:
-        if self.dataset_name:
-            return (
-                self.workspace
-                / f"{self.schema_prefix}{self.dataset_name}"
-                / f"{self.schema_prefix}{self.name}"
-            )
-        else:
-            return self.workspace / f"{self.schema_prefix}{self.name}"
-
-    ### Cache properties that make arcpy calls
-
-    @cached_property
-    def describe(self):
-        return arcpy.Describe(str(self.path))
-
-    @cached_property
-    def fields(self) -> list:
-        return arcpy.ListFields(str(self.path))
-
-    @cached_property
-    def exists(self):
-        """Whether the feature class or table exists at :attr:`path`.
-
-        Cached on first access — will not reflect creation or deletion after
-        the first call. Invalidate by deleting the attribute: ``del tbl.exists``.
-        """
-        return arcpy.Exists(str(self.path))
-
-    ### Don't cache simple lookups
-
-    @property
-    def data_type(self) -> str:
-        return self.describe.dataType
-
-    @property
-    def workspace_catalog_path(self) -> Path:
-        return Path(self.describe.workspace.catalogPath)
-
-    @property
-    def oid_field_name(self) -> str:
-        return self.describe.OIDFieldName
-
-    @property
-    def is_versioned(self) -> bool:
-        return self.describe.isVersioned
-
-    @property
-    def spatial_reference(self):
-        return self.describe.spatialReference
+    def path(self) -> str|Path:
+        if self.db_conn == "memory":
+            return _qualify_memory_path(self.name)
+        
+        return _qualify_db_path(
+            name=self.name,
+            db_conn=Path(self.db_conn),
+            db_prefix=self.db_prefix,
+            dataset_name=self.dataset_name,
+        )
     
     @property
-    def shape_col_name(self) -> str:
-        return self.describe.shapeFieldName
+    def dataset_path(self) -> Path|None:
+        if self.dataset_name is not None:
+            return _qualify_db_path(
+                name=self.dataset_name,
+                db_conn=Path(self.db_conn),
+                db_prefix=self.db_prefix,
+            )
+        else:
+            return None
 
-    @property
-    def fields_names(self) -> list[str]:
-        return [f.name for f in self.fields]
+    @property                
+    def pretty_path(self, depth: int|None = None) -> str:
+        if isinstance(self.path, Path):
+            parts = self.path.parts
+            depth = depth or (3 if self.dataset_name is not None else 2)
+            return '/'.join(parts[-depth:])
+        
+        else:
+            return str(self.path)
 
-    @property
+    def exists(self) -> bool:
+        return arcpy.Exists(str(self.path))
+
+    def assert_exists(self) -> bool:
+        e = self.exists()
+
+        if not e:
+            raise FileNotFoundError(f"CatalogPath does not exist: {self.path}")
+        
+        return e
+                
+    ### Only possible on table that exist
+    # Describe properties
+    def describe(self):
+        self.assert_exists()
+        return arcpy.Describe(str(self.path))
+
+    def data_type(self) -> str:
+        return self.describe().dataType
+
+    def workspace(self) -> Path:
+        return Path(self.describe().workspace.catalogPath)
+
+    def oid_field_name(self) -> str:
+        return self.describe().OIDFieldName
+
+    def shape_field_name(self) -> str:
+        return self.describe().shapeFieldName
+    
+    def is_versioned(self) -> bool:
+        return self.describe().isVersioned
+    
+    def assert_versioning_aligns(self) -> bool:
+
+        if self.dataset_name:
+            fc_isversioned = self.is_versioned()
+
+            dataset_isversioned = arcpy.Describe(str(self.dataset_path)).isVersioned
+
+            if not fc_isversioned == dataset_isversioned:
+                raise EnvironmentError("Versioning misalignment in FC / Dataset : " \
+                                        f"isVersioned({self.name})={fc_isversioned} != isVersioned({self.dataset_name})={dataset_isversioned}"
+                                       )
+            
+        return True
+        
+    def spatial_reference(self) -> arcpy.SpatialReference:
+        return self.describe().spatialReference
+
+    def crs(self) -> int:
+        return int(self.spatial_reference().factoryCode)
+
+    ### Fields 
+    def fields(self) -> list:
+        self.assert_exists()
+        return arcpy.ListFields(str(self.path))
+
+    def field_names(self) -> list[str]:
+        return [f.name for f in self.fields()]
+
     def field_types(self) -> dict[str, str]:
-        return {f.name: f.type for f in self.fields}
-
+        return {f.name: f.type for f in self.fields()}
 
     def row_count(self):
+        self.assert_exists()
         return int(arcpy.GetCount_management(str(self.path)).getOutput(0))
 
     def as_data_frame(self, 
@@ -140,7 +188,7 @@ class ESRITable:
         Args:
             field_names: Subset of fields to fetch. Fetches all fields if ``None``.
             where_clause: SQL where clause to filter rows. No filter if ``None``.
-            df_type: Output type — ``"pandas"``, ``"polars"``, or ``"pyarrow"``.
+            df_type: df type to return, one of ``"pandas"``, ``"polars"``, or ``"pyarrow"``.
 
         Raises:
             ValueError: One or more :attr:`field_names` are not present in the table.
@@ -151,7 +199,9 @@ class ESRITable:
             A DataFrame of the requested type containing the table's attributes.
         """
 
-        return fc_to_df(fc = self,
+        self.assert_exists()
+
+        return tbl_to_df(fc = self,
                         field_names=field_names,
                         where_clause=where_clause, 
                         df_type=df_type)
@@ -162,7 +212,7 @@ class ESRITable:
                     field_names:list[str] | None = None, 
                     fallback_crs : int | None = None,
                     allow_null_geometries:bool = False,
-                    to_crs:bool = False,
+                    to_crs: int | None = None,
                     ) -> gpd.GeoDataFrame:
         
         """Fetch this feature class as a GeoDataFrame with shapely geometries.
@@ -172,7 +222,7 @@ class ESRITable:
                 The geometry column is always included.
             where_clause: SQL where clause to filter rows. No filter if ``None``.
             allow_null_geometries: If ``True``, warn on null/invalid geometries instead
-                of raising. Covers missing values and shapes unparseable by shapely.
+                of raising. 
             fallback_crs: EPSG code to use when the feature class spatial reference
                 has no resolvable factory code (e.g. an improperly defined CRS).
             to_crs: If provided, reproject the result to this EPSG code.
@@ -184,38 +234,35 @@ class ESRITable:
             A GeoDataFrame with the feature class attributes and shapely geometries.
         """
 
+        self.assert_exists()
+
         return fc_to_gdf(fc = self,
                          field_names=field_names,
                          where_clause=where_clause,
                          allow_null_geometries=allow_null_geometries,
-                         shape_col=self.shape_col_name,
+                         shape_col=self.shape_field_name(),
                          fallback_crs=fallback_crs,
                          to_crs=to_crs
                          )
         
-
-
     def __repr__(self):
-        cls = self.__class__.__name__
         parts = [f"name='{self.name}'"]
 
         if self.dataset_name:
             parts.append(f"dataset='{self.dataset_name}'")
 
-        parts.append(f"conn='{self.workspace.name}'")
-        parts.append(f"prefix='{self.schema_prefix}'")
+        parts.append(f"conn='{self.db_conn}'")
+        parts.append(f"prefix='{self.db_prefix}'")
 
-        return f"{cls}({', '.join(parts)})"
+        return f"{self.__class__.__name__}({', '.join(parts)})"
 
 
     def __str__(self):
         return str(self.path)
+    
 
-
-def memory_str() -> str:
-    """Return a unique ArcGIS in-memory path, e.g. ``"memory/fc_4af874bd5b654bb7914e4165e2667a19"``."""
-    return f"memory/fc_{uuid4().hex}"
-
+    def __fspath__ (self):
+        return str(self.path)
 
 def _sanitize_arr_tbl(table: pa.Table, 
                       shape_col:str | None  = None, 
@@ -327,7 +374,6 @@ def _sanitize_arr_tbl(table: pa.Table,
             ))
 
         # Upcast unsigned integers to the smallest signed type that fits.
-        # uint64 → int64 is the only potentially lossy cast (values > 2^63-1).
         elif pa.types.is_unsigned_integer(field.type):
             
             fields.append(pa.field(
@@ -383,20 +429,16 @@ def _sr_from_gdf(gdf: gpd.GeoDataFrame) -> arcpy.SpatialReference:
     return sr
 
 
-@overload
-def df_to_fc(df: "pl.DataFrame|pd.DataFrame|gpd.GeoDataFrame", fc: ESRITable, mode: Literal["new", "overwrite", "append"] = ...) -> ESRITable: ...
-@overload
-def df_to_fc(df: "pl.DataFrame|pd.DataFrame|gpd.GeoDataFrame", fc: str|Path|None, mode: Literal["new", "overwrite", "append"] = ...) -> str: ...
-def df_to_fc(df: "pl.DataFrame|pd.DataFrame|gpd.GeoDataFrame",
-             fc: str|Path|ESRITable|None,
-             mode: Literal["new", "overwrite", "append"] = "new",
-             ) -> str|ESRITable:
+def df_to_tbl(df: "pl.DataFrame|pd.DataFrame",
+              fc: str|Path|CatalogPath|None,
+              mode: Literal["new", "overwrite", "append"] = "new",
+             ) -> str|CatalogPath:
     
-    """Write a DataFrame to an ArcGIS feature class or table.
+    """Write a DataFrame to an ArcGIS table.
 
     Args:
         df: A pandas DataFrame, GeoPandas GeoDataFrame, or Polars DataFrame.
-        fc: Destination path. Accepts a string, ``Path``, ``ESRITable``, or
+        fc: Destination path. Accepts a string, ``Path``, ``CatalogPath``, or
             ``None`` to write to a new in-memory workspace path.
         mode: ``"new"`` creates the feature class (errors if it exists),
             ``"overwrite"`` replaces it, ``"append"`` adds rows to an existing one.
@@ -406,37 +448,22 @@ def df_to_fc(df: "pl.DataFrame|pd.DataFrame|gpd.GeoDataFrame",
         FileNotFoundError: :attr:`mode` is ``"append"`` but :attr:`fc` does not exist.
 
     Returns:
-        The path to the written feature class. Returns the original ``ESRITable``
+        The path to the written feature class. Returns the original ``CatalogPath``
         when one is passed as :attr:`fc`, otherwise returns the path as a string.
     """
-
-    sr = None
-    is_spatial = False
-    shape_col = None
-
     if _POLARS_AVAILABLE and isinstance(df, pl.DataFrame):  # type: ignore[union-attr]
         df_arrow = df.to_arrow()
     # GeoDataFrame is a subclass of DataFrame and must be checked first
-    elif isinstance(df, gpd.GeoDataFrame):
-        shape_col = str(df.geometry.name)
-        _raw = df.to_arrow(geometry_encoding="WKB")
-        # Newer geopandas returns a wrapper, not a pa.Table.  Any Arrow-compatible
-        # object supports __arrow_c_stream__, so we round-trip through that.
-        if not isinstance(_raw, pa.Table):
-            _raw = pa.RecordBatchReader.from_stream(_raw).read_all()
-        df_arrow = _raw
-        sr = _sr_from_gdf(df)
-        is_spatial = True
     elif isinstance(df, pd.DataFrame):
         df_arrow = pa.Table.from_pandas(df, preserve_index=False)
     else:
-        raise TypeError("df must be a valid polars, geopandas, or pandas dataframe")
+        raise TypeError("df must be a valid pandas or polars dataframe")
 
-    df_san = _sanitize_arr_tbl(table=df_arrow, shape_col=shape_col, sr=sr)
+    df_san = _sanitize_arr_tbl(table=df_arrow)
 
     if fc is None:
         fc_p = memory_str()
-    elif isinstance(fc, ESRITable):
+    elif isinstance(fc, CatalogPath):
         fc_p = str(fc.path)
     else:
         fc_p = str(fc)
@@ -446,10 +473,7 @@ def df_to_fc(df: "pl.DataFrame|pd.DataFrame|gpd.GeoDataFrame",
             raise FileNotFoundError(f"Cannot append: target does not exist: {fc_p}")
         temp_fc = memory_str()
         try:
-            if is_spatial:
-                arcpy.management.CopyFeatures(in_features=df_san, out_feature_class=temp_fc)
-            else:
-                arcpy.management.CopyRows(in_rows=df_san, out_table=temp_fc)
+            arcpy.management.CopyRows(in_rows=df_san, out_table=temp_fc)
             arcpy.management.Append(
                 inputs=temp_fc,
                 target=fc_p,
@@ -462,25 +486,115 @@ def df_to_fc(df: "pl.DataFrame|pd.DataFrame|gpd.GeoDataFrame",
             if arcpy.Exists(temp_fc):
                 arcpy.management.Delete(temp_fc)
     else:
-        with arcpy.EnvManager(overwriteOutput=(mode == "overwrite")):
-            if is_spatial:
-                arcpy.management.CopyFeatures(in_features=df_san, out_feature_class=fc_p)
-            else:
-                arcpy.management.CopyRows(in_rows=df_san, out_table=fc_p)
+        with arcpy.EnvManager(overwriteOutput= (mode == "overwrite")):
+            arcpy.management.CopyRows(in_rows=df_san, out_table=fc_p)
 
-    if isinstance(fc, ESRITable):
+    if isinstance(fc, CatalogPath):
+        return fc
+    return fc_p
+
+def gdf_to_fc(df: "gpd.GeoDataFrame",
+             fc: str|Path|CatalogPath|None,
+             mode: Literal["new", "overwrite", "append"] = "new",
+             ) -> str|CatalogPath:
+    
+    """Write a GeoDataFrame to an ArcGIS feature class.
+
+    Args:
+        df: A GeoPandas GeoDataFrame
+        fc: Destination path. Accepts a string, ``Path``, ``CatalogPath``, or
+            ``None`` to write to a new in-memory workspace path.
+        mode: ``"new"`` creates the feature class (errors if it exists),
+            ``"overwrite"`` replaces it, ``"append"`` adds rows to an existing one.
+
+    Raises:
+        TypeError: :attr:`df` is not a supported DataFrame type.
+        FileNotFoundError: :attr:`mode` is ``"append"`` but :attr:`fc` does not exist.
+
+    Returns:
+        The path to the written feature class. Returns the original ``CatalogPath``
+        when one is passed as :attr:`fc`, otherwise returns the path as a string.
+    """
+
+    sr = None
+    shape_col = None
+
+    if isinstance(df, gpd.GeoDataFrame):
+        shape_col = str(df.geometry.name)
+        _raw = df.to_arrow(geometry_encoding="WKB")
+        # Newer geopandas returns a wrapper, not a pa.Table.  Any Arrow-compatible
+        # object supports __arrow_c_stream__, so we round-trip through that.
+        if not isinstance(_raw, pa.Table):
+            _raw = pa.RecordBatchReader.from_stream(_raw).read_all()
+        df_arrow = _raw
+        sr = _sr_from_gdf(df)
+    else:
+        raise TypeError("df must be a valid polars, geopandas, or pandas dataframe")
+
+    df_san = _sanitize_arr_tbl(table=df_arrow, shape_col=shape_col, sr=sr)
+
+    if fc is None:
+        fc_p = memory_str()
+        target_exists = False
+    elif isinstance(fc, CatalogPath):
+        if not fc.exists():
+            raise ValueError("Passing a non-existent CatalogPath is not supported.")
+        fc_p = str(fc.path)
+        target_exists =  fc.exists
+    else:
+        fc_p = str(fc)
+        target_exists = arcpy.Exists(fc_p)
+
+
+    if mode in ["new", "ovewrite"]:
+        if mode == "new":
+            if target_exists:
+                raise FileExistsError(f"Cannot create fc with mode='new': target already exists: {fc_p}")
+            else:
+                overwrite = False
+        else:
+            overwrite = True
+
+        with arcpy.EnvManager(overwriteOutput=overwrite):
+            arcpy.management.CopyFeatures(in_features=df_san, out_feature_class=fc_p)
+
+    elif mode == "append":
+        if not target_exists:
+            raise FileNotFoundError(f"Cannot create fc with mode='append': target does not exist: {fc_p}")
+        
+        temp_fc = memory_str()
+        try:
+            arcpy.management.CopyFeatures(in_features=df_san, out_feature_class=temp_fc)
+            arcpy.management.Append(
+                inputs=temp_fc,
+                target=fc_p,
+                schema_type="NO_TEST",
+            )
+            arcpy_warnings = arcpy.GetMessages(1)
+            if arcpy_warnings:
+                warnings.warn(arcpy_warnings, stacklevel=2)
+        finally:
+            if arcpy.Exists(temp_fc):
+                arcpy.management.Delete(temp_fc)
+
+    else:
+        raise ValueError(f"'mode' must be one of ['new', 'overwrite', 'append'] (got {mode})")
+    
+    
+    if isinstance(fc, CatalogPath):
         return fc
     return fc_p
 
 
-def _resolve_fc(fc: str|Path|ESRITable) -> tuple[bool, list[str], str]:
+
+def _resolve_fc(fc: str|Path|CatalogPath) -> tuple[bool, list[str], str]:
     """
     Get info needed to validate a fc. Helper for `fc_to_df()`
     """
 
-    if isinstance(fc, ESRITable):
-        exists = fc.exists
-        available_fields = fc.fields_names
+    if isinstance(fc, CatalogPath):
+        exists = fc.exists()
+        available_fields = fc.field_names()
         fc_p = str(fc.path)
     else:
         fc_p = str(fc)
@@ -490,13 +604,13 @@ def _resolve_fc(fc: str|Path|ESRITable) -> tuple[bool, list[str], str]:
     return exists, available_fields, fc_p
 
 
-def fc_to_df(fc: str|Path|ESRITable,
+def tbl_to_df(fc: str|Path|CatalogPath,
              field_names: list[str] | None = None,
              where_clause: str | None = None,
              df_type: Literal["pandas", "polars", "pyarrow"] = "pandas",
             ) -> "pd.DataFrame|pl.DataFrame|pa.Table":
     
-    """Fetch a table or feature class as a DataFrame (attributes only).
+    """Fetch a table or the non-spatial attributes of a feature class as a DataFrame.
 
     Wraps ``arcpy.da.TableToArrowTable()`` with field validation and existence
     checks. For spatial data with usable geometries use ``fc_to_gdf()`` instead.
@@ -530,13 +644,14 @@ def fc_to_df(fc: str|Path|ESRITable,
         
     arr = arcpy.da.TableToArrowTable(in_table = fc_p, 
                                      field_names=field_names, 
-                                     where_clause=where_clause
+                                     where_clause=where_clause,
+                                     geometry_encoding="WKT"
                                      )
     if df_type == "pandas":
         return arr.to_pandas()
     elif df_type == "polars":
         if not _POLARS_AVAILABLE:
-            raise ImportError("polars is not installed. Install it with: pip install arcpy_arrow[polars]")
+            raise ImportError("polars is not installed.")
         return pl.from_arrow(arr)  # type: ignore[union-attr]
     elif df_type == "pyarrow":
         return arr
@@ -595,9 +710,7 @@ def _load_gdf_from_arr(arr: pa.Table,
             factory_code_proj = fallback_crs
 
 
-    # Drop the raw WKB bytes column — geometry is now held as shapely objects.
-    # Keeping it would leave a stale binary column that breaks a subsequent
-    # df_to_fc call (two binary columns, only one being the active geometry).
+    # Drop the raw WKB bytes column, convert to gdf
     gdf = gpd.GeoDataFrame(df.drop(columns=[shape_col]),
                             geometry=geometries,
                             crs=factory_code_proj
@@ -609,7 +722,7 @@ def _load_gdf_from_arr(arr: pa.Table,
     return gdf
 
 
-def fc_to_gdf(fc: str|Path|ESRITable,
+def fc_to_gdf(fc: str|Path|CatalogPath,
              field_names: list[str] | None = None, 
              where_clause: str | None = None, 
              allow_null_geometries : bool = False,
@@ -627,7 +740,7 @@ def fc_to_gdf(fc: str|Path|ESRITable,
         allow_null_geometries: If ``True``, warn on null/invalid geometries instead
             of raising. Covers missing values and shapes unparseable by shapely.
         shape_col: Name of the geometry column. Auto-detected from :attr:`fc` when
-            an ``ESRITable`` is passed; defaults to ``"Shape"`` otherwise.
+            an ``CatalogPath`` is passed; defaults to ``"Shape"`` otherwise.
         fallback_crs: EPSG code to use when the feature class spatial reference
             has no resolvable factory code (e.g. an improperly defined CRS).
         to_crs: If provided, reproject the result to this EPSG code.
@@ -649,8 +762,8 @@ def fc_to_gdf(fc: str|Path|ESRITable,
         if bad_fields:  
             raise ValueError(f"The requested fields do not exist: {', '.join(bad_fields)}")
     
-    shape_col = shape_col or (fc.shape_col_name if isinstance(fc, ESRITable) else "Shape")
-    sr = fc.spatial_reference if isinstance(fc, ESRITable) else arcpy.Describe(fc_p).spatialReference
+    shape_col = shape_col or (fc.shape_field_name() if isinstance(fc, CatalogPath) else "Shape")
+    sr = fc.spatial_reference() if isinstance(fc, CatalogPath) else arcpy.Describe(fc_p).spatialReference
 
     # Always include the geometry column even when field_names is a subset.
     if field_names is not None and shape_col not in field_names:

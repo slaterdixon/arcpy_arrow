@@ -1,16 +1,4 @@
-"""
-.. include:: ./README.md
-
-**arcpy_arrow** is a Python package that provides lightweight translation between ESRI tables/feature classes and standard Python dataframes, powered by the Apache Arrow format. 
-
-**Example workflows:**
-- Join and clean Excel exports in `pandas` and write the results straight to a EGDB table, 
-- Bulk update feature attributes in seconds, without touching a `UpdateCursor()` or Field Calc
-- Buffer, dissolve, and spatially-join data in `geopandas` without dealing with workspaces or intermediate results — then visualize the final feature class in Pro
-- Easily audit data and dump archives to disk as Excel, parquet, or feather files
-
----
-"""
+"""Lightweight translation between ESRI tables/feature classes and Python dataframes via Apache Arrow."""
 
 
 _ESRI_DEPS = ["arcpy", "pyarrow", "pandas", "geopandas", "shapely"]
@@ -22,17 +10,19 @@ if _missing:
     )
 
 from arcpy_arrow.interop import (
-    ESRITable,
-    df_to_fc,
-    fc_to_df,
+    CatalogPath,
+    df_to_tbl,
+    tbl_to_df,
+    gdf_to_fc,
     fc_to_gdf,
     memory_str,
 )
 
 __all__ = [
-    "ESRITable",
-    "df_to_fc",
-    "fc_to_df",
+    "CatalogPath",
+    "df_to_tbl",
+    "tbl_to_df",
+    "gdf_to_fc",
     "fc_to_gdf",
     "memory_str",
 ]
