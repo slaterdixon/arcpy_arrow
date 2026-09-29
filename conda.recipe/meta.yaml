@@ -7,7 +7,7 @@ source:
 
 build:
   number: 0
-  # --no-deps: all runtime deps (arcpy, pyarrow, pandas, geopandas, shapely)
+  # --no-deps: all runtime deps 
   # are provided by the ArcGIS Pro conda environment and must not be reinstalled.
   script: "{{ PYTHON }} -m pip install --no-deps --ignore-installed -vv ."
 
@@ -19,8 +19,9 @@ requirements:
 
   run:
     - python
-    # arcpy, pyarrow, pandas, geopandas, and shapely are intentionally omitted —
-    # they are expected to already be present in the ArcGIS Pro conda environment.
+    - shapely
+    - geopandas
+    # other packages are expected to already be present in the ArcGIS Pro conda environment.
 
 test:
   imports:
