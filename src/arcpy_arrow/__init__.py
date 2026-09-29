@@ -5,8 +5,7 @@ _ESRI_DEPS = ["arcpy", "pyarrow", "pandas", "geopandas", "shapely"]
 _missing = [pkg for pkg in _ESRI_DEPS if __import__("importlib.util", fromlist=["find_spec"]).find_spec(pkg) is None]
 if _missing:
     raise ImportError(
-        f"arcpy_arrow requires the following packages that were not found: {_missing}. "
-        "These are expected to be present in the ArcGIS Pro conda environment."
+        f"arcpy_arrow requires the following packages that were not found: {_missing}."
     )
 
 from arcpy_arrow.interop import (
