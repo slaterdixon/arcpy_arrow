@@ -478,7 +478,11 @@ def df_to_tbl(df: "pl.DataFrame|pd.DataFrame",
     elif not isinstance(df, gpd.GeoDataFrame) and isinstance(df, pd.DataFrame):
         df_arrow = pa.Table.from_pandas(df, preserve_index=False)
     else:
-        raise TypeError("df must be a valid non-spatial pandas or polars dataframe")
+        if isinstance(df, gpd.GeoDataFrame):
+            raise TypeError("Passing a GeoDataFrame is not supported. Drop the geometry first (e.g. df.drop(columns=df.geometry.name)), or use"
+                            "gdf_to_fc() to write to a Feature Class.")
+        else:
+            raise TypeError("df must be a valid non-spatial pandas or polars dataframe.")
 
     if tbl is None:
         tbl_p = memory_str()
@@ -546,7 +550,7 @@ def gdf_to_fc(gdf: "gpd.GeoDataFrame",
 
     if isinstance(gdf, gpd.GeoDataFrame):
         shape_col = str(gdf.geometry.name)
-        _raw = gdf.to_arrow(geometry_encoding="WKB")
+        _raw = gdf.to_arrow(geometry_encoding="WKB", index = False)
         # Newer geopandas returns a wrapper, not a pa.Table.  Any Arrow-compatible
         # object supports __arrow_c_stream__, so we round-trip through that.
         if not isinstance(_raw, pa.Table):
