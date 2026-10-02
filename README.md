@@ -15,11 +15,9 @@ Leave the world of Field Mappings, Join/Calc, and UpdateCursors behind, without 
 | *Tabular* | `tbl_to_df()` | `df_to_tbl()` |
 | *Spatial* | `fc_to_gdf()`   | `gdf_to_fc()` |
 
-
 ## Requirements 
 * ArcGIS Pro 3.5+ (Python ≥ 3.11)
 * A conda environment [cloned](https://doc.esri.com/en/arcgis-pro/latest/arcpy/get-started/clone-an-environment.html) from `arcgispro-py3`
-
 
 ## Installation
 ```{cmd}
@@ -33,6 +31,7 @@ To work with `polars` DataFrames, also install:
 conda install polars
 ```
 ## Quick Start
+### Interop
 To get started, fetch a Feature Class as a GeoDataFrame:
 
 ```{python}
@@ -53,7 +52,7 @@ gdf.plot(column = "POP")
 ```
 And write results to a Enteprise Geodatabase table:
 
-```
+```{python}
 from arcpy_arrow import gdf_to_fc
 
 gdf_to_fc(
@@ -63,10 +62,12 @@ gdf_to_fc(
 )
 ```
 
-`fc_to_gdf` allows a number of modes, `"new", "overwrite", "append", and "delete_append"` depending on whether the destination already exists. Spatial references, schema sanitization, and metadata are handled for you.
+`fc_to_gdf` allows a number of modes, `"new", "overwrite", "append", and "delete_append"` depending on whether the destination already exists. When appending to an existing table, schema violations in your DataFrame will raise loud errors to prevent silent data loss/truncation. 
 
+### CatalogPath
+`CatalogPath` is an alternative to the standard string or `pathlib` objects used to resolve Feature Classes and Tables via .sde connection files. It makes path construction easier and exposes several helpful attributes and methods that return objects as native Python types, not fiddly `arcpy` objects. 
 
-`CatalogPath` is an alternative to standard string or `pathlib` objects. It makes path construction easier and exposes several helpful attributes and methods that let you avoid fiddly `arcpy` syntax.
+For example, `CatalogPath.field_names()` returns a native list of string names. 
 
 ```{python}
 from arcpy_arrow import CatalogPath
@@ -79,7 +80,29 @@ tbl = CatalogPath(
     db_prefix="sde.gis."
 )
 
-tbl.field_names()
+main _names = tbl.field_names()
+
+main _names
+>>> ['OBJECTID',
+>>>  'MAINID',
+>>>  'DIAMETER',
+>>>  'MATERIAL',
+>>>  'TRANSMISSION',
+>>>  'SUBDIVISION',
+>>>    ...]
+```
+
+```{python}
+main _names == [f.name for f in arcpy.ListFields(str(tbl))]
+>>> True
+```
+
+The `CatalogPath` helpers are available individually in the `helpers` module.
+
+```{python}
+from arcpy_arrow.helpers import ap_field_names
+
+ap_field_names(Path(r"C:\connections\db.sde\sde.gis.WaterDistribution\wMain"))
 
 >>> ['OBJECTID',
 >>>  'MAINID',
