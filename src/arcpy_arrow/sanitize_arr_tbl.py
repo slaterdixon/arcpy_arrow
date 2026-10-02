@@ -26,18 +26,8 @@ class DestField():
     field_arcpy: arcpy.Field
     field_pyarrow: pa.Field
 
-def is_ascii(s):
-    try:
-        s.decode("ascii")
-        return True
-    except UnicodeDecodeError:
-        return False
 
-def table_fields_are_ascii(table: pa.Table):
 
-    for field in table.field:
-        if not is_ascii(field.name):
-            raise ValueError(f"Invalid field name: '{field.name}'. Field names must contain ASCII characters only.")
 
 def _field_metadata(field: pa.Field) -> dict[str, str]:
 
@@ -83,6 +73,15 @@ _ALLOWED_CASTS = {
     ("timestamp_offset", "timestamp_offset"),
     ("other", "other"),
 }
+
+
+_BAD_PA_TYPES = [
+        (pa.types.is_list, "List types are not supported"),
+        (pa.types.is_duration, "Duration types are not supported"),
+        (pa.types.is_null, "All-null columns are not supported"),
+        (pa.types.is_decimal, "Decimal types are not supported")
+]
+
 
 _PARSE = "Parse it first, e.g. pd.to_numeric(df[col])."
 _FORMAT = "Format it first, e.g. df[col].astype(str)."
@@ -298,9 +297,18 @@ def _validate_against_template(table: pa.Table,
     if problems:
         raise ValueError(f"The data can not be written to {template_p}:\n  - " + "\n  - ".join(problems))
 
+def _pa_fieldtype_supported(field: pa.Field):
 
+    for is_func, message in _BAD_PA_TYPES:
+        if is_func(field):
+            raise ValueError(f"Problem with field '{field.name}': {message}",
+                             "Drop or cast this column before calling.")
 
+def _pa_fieldname_isascii(field: pa.Field):
+    if not field.name.isascii():
+        raise ValueError(f"Problem with field '{field.name}': Field names must contain ASCII characters only.")
 
+    
 def _sanitize_arr_tbl(table: pa.Table,
                       shape_col:str | None  = None,
                       sr:SpatialReference | None = None,
@@ -348,9 +356,12 @@ def _sanitize_arr_tbl(table: pa.Table,
     columns = []
     parsed_shape = shape_col is None
 
-    table_fields_are_ascii(table)
 
     for i, field in enumerate(table.schema):
+
+
+        _pa_fieldname_isascii(table)
+        _pa_fieldtype_supported(field)
 
         column = table.column(i)
 

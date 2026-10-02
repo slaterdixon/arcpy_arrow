@@ -50,7 +50,7 @@ gdf = fc_to_gdf(fc = states_url,
 
 gdf.plot(column = "POP")
 ```
-And write results to a Enteprise Geodatabase table:
+And write results to a Enterprise Geodatabase table:
 
 ```{python}
 from arcpy_arrow import gdf_to_fc
