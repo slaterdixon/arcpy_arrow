@@ -1,22 +1,17 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "arcpy_arrow"
 version = "0.1.0"
 description = "Arrow-based helpers for moving data between ArcPy and dataframes"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE.md"]
 requires-python = ">=3.11"
-dependencies = [
-    # All runtime dependencies (pandas, geopandas, pyarrow, shapely, arcpy)
-    # are expected to be present in the ArcGIS Pro conda environment.
-    # They are intentionally omitted here to prevent pip from installing
-    # conflicting versions over the conda-managed packages.
-]
-
-[project.optional-dependencies]
-polars = ["polars"]
-dev = ["pytest"]
+# Runtime deps are declared in conda.recipe/meta.yaml
+dependencies = []
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -24,9 +19,3 @@ where = ["src"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
-
-
-
-
-
-
