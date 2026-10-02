@@ -1,31 +1,41 @@
+{% set version = "0.1.0" %}
+
 package:
   name: arcpy_arrow
-  version: 0.1.0
+  version: {{ version }}
 
 source:
-  path: ..
+  url: https://github.com/slaterdixon/arcpy_arrow/archive/refs/tags/v{{ version }}.tar.gz
+  sha256: <fill in>
 
 build:
   number: 0
-  # --no-deps: all runtime deps 
-  # are provided by the ArcGIS Pro conda environment and must not be reinstalled.
-  script: "{{ PYTHON }} -m pip install --no-deps --ignore-installed -vv ."
+  noarch: python
+  script: {{ PYTHON }} -m pip install . -vv --no-deps --no-build-isolation
 
 requirements:
   host:
-    - python
+    - python >=3.11
     - pip
-    - setuptools
-
+    - setuptools >=77
   run:
-    - python
+    - python >=3.11
     - shapely
     - geopandas
-    # other packages are expected to already be present in the ArcGIS Pro conda environment.
+    # arcpy, pandas, pyarrow come from arcgispro-py3; checked at import time
 
 test:
-  imports:
-    - arcpy_arrow
+  requires:
+    - pip
+  commands:
+    - pip check
 
 about:
+  home: https://github.com/<you>/arcpy_arrow
   summary: Arrow-based helpers for moving data between ArcPy and dataframes
+  license: MIT
+  license_file: LICENSE.md
+
+extra:
+  recipe-maintainers:
+    - slaterdixon
