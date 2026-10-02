@@ -1,18 +1,39 @@
 # arcpy_arrow
 
-**arcpy_arrow** is a package for round-tripping ArcGIS Feature Classes/Tables and Python DataFrames. It gives ArcGIS Pro users access to the speed and ergonomics of modern data analysis workflows. 
+**arcpy_arrow** is a lightweight library for roundtripping ArcGIS data and Python DataFrames, backed by Esri's native Apache Arrow support. 
 
-using the Apache Arrow format as a seamless translation layer. For more information, see the project [documentation]().
+Leave the world of Field Mappings, Join/Calc, and UpdateCursors behind, without sacrificing compatiblity with your geodatabases.
 
-## Quick Start
+*Use cases include*:
+- Interactively query, join, and transform your data as `pandas`, `geopandas`, and `polars` dataframes
+- Quickly dump a Feature Class or Table to DuckDB, parquet, or Excel
+- Write robust, Pythonic scripts using `CatalogPath` objects
 
-Install into a [cloned](https://pro.arcgis.com/en/pro-app/3.4/arcpy/get-started/clone-an-environment.htm) ArcGIS Pro conda environment with the following command:
 
-```{python}
-conda activate <your env> && conda install -c ... arcpy_arrow
+|         | DB → DF         | DF → DB       |
+| ------- | --------------- | ------------- |
+| *Tabular* | `tbl_to_df()` | `df_to_tbl()` |
+| *Spatial* | `fc_to_gdf()`   | `gdf_to_fc()` |
+
+
+## Requirements 
+* ArcGIS Pro 3.5+ (Python ≥ 3.11)
+* A conda environment [cloned](https://doc.esri.com/en/arcgis-pro/latest/arcpy/get-started/clone-an-environment.html) from `arcgispro-py3`
+
+
+## Installation
+```{cmd}
+conda activate <your env> 
+conda install shapely geopandas
+conda install -c conda-forge arcpy_arrow
 ```
 
-Then, fetch a feature class as a GeoDataFrame:
+To work with `polars` DataFrames, also install:
+```{cmd}
+conda install polars
+```
+## Quick Start
+To get started, fetch a Feature Class as a GeoDataFrame:
 
 ```{python}
 from arcpy_arrow.interop import fc_to_gdf
@@ -20,17 +41,72 @@ from arcpy_arrow.interop import fc_to_gdf
 states_url = ("https://services.arcgis.com/ue9rwulIoeLEI9bj/" 
             "arcgis/rest/services/US_StateBoundaries/FeatureServer/0")
 
-where_c = "STATE_ABBR NOT IN ('HI', 'AK', 'PR', 'GU')"
+TARGET_CRS = 4269
+WHERE_C = "STATE_ABBR NOT IN ('HI', 'AK', 'PR', 'GU')"
 
-fc_to_gdf(fc = states_url, 
-            where_clause=where_c).plot(column = "POP")
+gdf = fc_to_gdf(fc = states_url, 
+                where_clause=WHERE_C,
+                to_crs = TARGET_CRS,
+            )
+
+gdf.plot(column = "POP")
 ```
-![alt text](image-2.png)
+And write results to a Enteprise Geodatabase table:
 
-Full installation instructions are available [here]().
+```
+from arcpy_arrow import gdf_to_fc
 
-## License & Disclaimer
+gdf_to_fc(
+    gdf = gdf,
+    dest = Path(r"C:\connections\db.sde\Continental_States"),
+    mode = "new"
+)
+```
+
+`fc_to_gdf` allows a number of modes, `"new", "overwrite", "append", and "delete_append"` depending on whether the destination already exists. Spatial references, schema sanitization, and metadata are handled for you.
 
 
+`CatalogPath` is an alternative to standard string or `pathlib` objects. It makes path construction easier and exposes several helpful attributes and methods that let you avoid fiddly `arcpy` syntax.
+
+```{python}
+from arcpy_arrow import CatalogPath
+from pathlib import Path
+
+tbl = CatalogPath(
+    name = "wMain",
+    db_conn = r"C:\connections\db.sde",
+    dataset_name="WaterDistribution",
+    db_prefix="sde.gis."
+)
+
+tbl.field_names()
+
+>>> ['OBJECTID',
+>>>  'MAINID',
+>>>  'DIAMETER',
+>>>  'MATERIAL',
+>>>  'TRANSMISSION',
+>>>  'SUBDIVISION',
+>>>    ...]
+```
+
+## Examples
+For more help, see the example notebooks in [examples/](examples/):
+
+* [Basic usage](examples/01_BasicUsage.ipynb)
+* [Using CatalogPaths](examples/02_UsingCatalogPaths.ipynb)
+* [Benchmark vs. the Spatially Enabled DataFrame](examples/03_BenchmarkVsSEDF.ipynb)
+
+## Development
+From a cloned `arcgispro-py3` environment:
+```{cmd}
+conda install shapely geopandas polars pytest
+pip install --no-deps -e .
+pytest
+```
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE.md](LICENSE.md) file for details.
 
 
