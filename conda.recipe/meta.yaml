@@ -31,7 +31,7 @@ test:
     - pip check
 
 about:
-  home: https://github.com/<you>/arcpy_arrow
+  home: https://github.com/slaterdixon/arcpy_arrow
   summary: Arrow-based helpers for moving data between ArcPy and dataframes
   license: MIT
   license_file: LICENSE.md
