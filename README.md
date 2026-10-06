@@ -62,7 +62,7 @@ gdf_to_fc(
 )
 ```
 
-`fc_to_gdf` allows a number of modes, `"new", "overwrite", "append", and "delete_append"` depending on whether the destination already exists. When appending to an existing table, schema violations in your DataFrame will raise loud errors to prevent silent data loss/truncation. 
+`gdf_to_fc` and `df_to_tbl` take `mode="new"` (the default), `"overwrite"`, or `"append"`, depending on whether the destination already exists. When appending to an existing table, schema violations in your DataFrame will raise loud errors to prevent silent data loss/truncation. 
 
 ### CatalogPath
 `CatalogPath` is an alternative to the standard string or `pathlib` objects used to resolve Feature Classes and Tables via .sde connection files. It makes path construction easier and exposes several helpful attributes and methods that return objects as native Python types, not fiddly `arcpy` objects. 
