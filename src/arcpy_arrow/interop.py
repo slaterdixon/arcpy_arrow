@@ -10,11 +10,14 @@ import pandas as pd
 from dataclasses import dataclass
 import arcpy
 import geopandas as gpd
+from geopandas.array import (
+        LINE_GEOM_TYPES,
+        POINT_GEOM_TYPES,
+        POLYGON_GEOM_TYPES,
+    )
+
 from .sanitize_arr_tbl import _sanitize_arr_tbl
-
-
-from .helpers import *
-
+from .helpers import ap_exists, ap_has_zm, ap_row_count, ap_shapetype, ap_workspace
 
 try:
     import polars as pl
@@ -354,17 +357,13 @@ def _sr_from_gdf(gdf: gpd.GeoDataFrame) -> arcpy.SpatialReference:
     epsg = gdf.crs.to_epsg()
     if epsg is not None:
         return arcpy.SpatialReference(epsg)
-    
-    # Fall back to WKT for CRS without a clean EPSG code
-    sr = arcpy.SpatialReference()
-    sr.loadFromString(gdf.crs.to_wkt())
-    return sr
+    else:
+        raise ValueError(f"Could not build SpatialReference from CRS '{gdf.crs}' with no EPSG. Non-EPSG references are currently not supported.")
 
 
-WriteMode = Literal["new", "overwrite", "append", "delete_append"]
-_WRITE_MODES = ("new", "overwrite", "append", "delete_append")
-# Modes that write into an existing table rather than creating one
-_EXISTING_TARGET_MODES = ("append", "delete_append")
+
+WriteMode = Literal["new", "overwrite", "append"]
+_WRITE_MODES = ("new", "overwrite", "append")
 
 
 def _check_mode(mode: str) -> None:
@@ -383,37 +382,37 @@ def _dropped_fields(source_p: str, target_p: str) -> list[str]:
             and f.editable
             and f.name.lower() not in target_names]
 
+def _shapetypes_align(temp_p: str, target_p: str):
 
-def _delete_rows(target_p: str) -> None:
-    """``arcpy.management.DeleteRows()`` with a readable error for versioning/editor problems."""
-    try:
-        arcpy.management.DeleteRows(target_p)
-    except arcpy.ExecuteError as e:
-        if "ERROR 160250" in str(e):
-            is_versioned = getattr(arcpy.Describe(target_p), "isVersioned", "unknown")
-            raise RuntimeError(
-                f"Could not delete rows in {target_p}. This happens when an editor is configured "
-                "improperly, or there are mixed version types in the destination dataset "
-                f"(isVersioned={is_versioned})."
-            ) from e
-        raise
+    src_shapetype =  ap_shapetype(temp_p) 
+    dest_shapetype = ap_shapetype(target_p)
+
+    if src_shapetype != dest_shapetype:
+        raise ValueError(f"Can not append features with shapeType '{src_shapetype}' into "
+                         f"Feature Class with shapeType '{dest_shapetype}'")
+
+    src_z, src_m = ap_has_zm(temp_p)
+    dest_z, dest_m = ap_has_zm(target_p)
+
+    if src_z != dest_z:
+        raise ValueError(f"Can not append features with hasZ={src_z} into Feature Class with hasZ={dest_z}")
+    if src_m != dest_m:
+        raise ValueError(f"Can not append features with hasM={src_m} into Feature Class with hasM={dest_m}")
 
 
 def _append_via_memory(df_san: pa.Table,
                        target_p: str,
-                       copy_tool: Callable[[pa.Table, str], object],
-                       delete_first: bool) -> None:
-    """Stage :attr:`df_san` in memory, optionally delete the target's rows, then Append.
+                       copy_tool: Callable[[pa.Table, str], object]) -> None:
+    """Stage :attr:`df_san` in memory, then Append it to the existing :attr:`target_p`.
 
-    Staging first means conversion failures happen before any rows are deleted.
     :attr:`df_san` must already have been validated against the target with
-    ``_sanitize_arr_tbl(template=target_p)``.
+    ``_sanitize_arr_tbl(template=target_p)``. Nothing is deleted from the target.
     """
     temp_p = memory_str()
     try:
         copy_tool(df_san, temp_p)
 
-        staged_count = int(arcpy.management.GetCount(temp_p).getOutput(0))
+        staged_count = ap_row_count(temp_p)
         if staged_count != df_san.num_rows:
             raise ValueError(f"Staging dropped rows: {df_san.num_rows} in the table, {staged_count} staged")
 
@@ -422,8 +421,7 @@ def _append_via_memory(df_san: pa.Table,
             warnings.warn(f"{len(dropped)} column(s) are not in {target_p} and will not be written: "
                           f"{', '.join(dropped)}", stacklevel=3)
 
-        if delete_first:
-            _delete_rows(target_p)
+        _shapetypes_align(temp_p, target_p)
 
         arcpy.management.Append(
             inputs=temp_p,
@@ -438,6 +436,30 @@ def _append_via_memory(df_san: pa.Table,
             arcpy.management.Delete(temp_p)
 
 
+def _resolve_target(dest: str|Path|CatalogPath|None, mode: WriteMode) -> str:
+    """Path string to write to, after checking that :attr:`dest` suits :attr:`mode`.
+
+    ``None`` is a new in-memory path. ``"append"`` needs an existing target and ``"new"`` needs
+    a free one. A ``CatalogPath`` that doesn't exist yet needs an existing dataset or workspace.
+    """
+    if dest is None:
+        if mode == "append":
+            raise FileNotFoundError("Cannot use mode='append' without a target to append to")
+        return memory_str()
+
+    path = str(dest.path) if isinstance(dest, CatalogPath) else str(dest)
+    exists = arcpy.Exists(path)
+
+    if mode == "append" and not exists:
+        raise FileNotFoundError(f"Cannot use mode='append': target does not exist: {path}")
+    if mode == "new" and exists:
+        raise FileExistsError(f"Cannot use mode='new': target already exists: {path}")
+    if not exists and isinstance(dest, CatalogPath):
+        dest.assert_parent_exists()
+
+    return path
+
+
 def df_to_tbl(df: "pl.DataFrame|pd.DataFrame",
               tbl: str|Path|CatalogPath|None = None,
               *,
@@ -450,21 +472,21 @@ def df_to_tbl(df: "pl.DataFrame|pd.DataFrame",
         df: A pandas or Polars DataFrame.
         tbl: Destination path. Accepts a string, ``Path``, ``CatalogPath``, or
             ``None`` to write to a new in-memory workspace path.
-        mode: ``"new"`` creates the table (errors if it exists),
-            ``"overwrite"`` drops and recreates it, ``"append"`` adds rows to an
-            existing one, ``"delete_append"`` deletes an existing table's rows
-            and then appends, keeping its schema, domains, privileges and versioning.
+        mode: ``"new"`` creates the table (errors if it exists), ``"overwrite"``
+            drops and recreates it, ``"append"`` adds rows to an existing one.
+            Rows are never deleted from an existing table: replacing them atomically is up to the caller.
 
     Raises:
         TypeError: :attr:`df` is not a supported DataFrame type.
-        ValueError: :attr:`mode` is not one of the allowed values.
-        FileNotFoundError: :attr:`mode` is ``"append"`` or ``"delete_append"`` but :attr:`tbl`
-            does not exist, or :attr:`tbl` is a new ``CatalogPath`` whose dataset or workspace does not exist.
-        RuntimeError: ``"delete_append"`` could not delete rows due to versioning or editor configuration.
+        ValueError: :attr:`mode` is not one of the allowed values, or, for ``"append"``,
+            the data would be lost or changed by the existing table's schema.
+        FileExistsError: :attr:`mode` is ``"new"`` but :attr:`tbl` already exists.
+        FileNotFoundError: :attr:`mode` is ``"append"`` but :attr:`tbl` does not exist, or
+            :attr:`tbl` is a new ``CatalogPath`` whose dataset or workspace does not exist.
 
     Warns:
         UserWarning: Columns in :attr:`df` with no matching field in an existing
-            :attr:`tbl` are not written (``"append"`` and ``"delete_append"``).
+            :attr:`tbl` are not written (``"append"``).
 
     Returns:
         :attr:`tbl` exactly as passed, or the new in-memory path string when
@@ -484,31 +506,40 @@ def df_to_tbl(df: "pl.DataFrame|pd.DataFrame",
         else:
             raise TypeError("df must be a valid non-spatial pandas or polars dataframe.")
 
-    if tbl is None:
-        tbl_p = memory_str()
-    elif isinstance(tbl, CatalogPath):
-        tbl_p = str(tbl.path)
-        if mode not in _EXISTING_TARGET_MODES and not tbl.exists():
-            tbl.assert_parent_exists()
-    else:
-        tbl_p = str(tbl)
+    tbl_p = _resolve_target(tbl, mode)
 
-    if mode in _EXISTING_TARGET_MODES and not arcpy.Exists(tbl_p):
-        raise FileNotFoundError(f"Cannot use mode='{mode}': target does not exist: {tbl_p}")
-
-    # Appending validates the data against the existing table before anything is staged or deleted
+    # Appending validates the data against the existing table before anything is staged or written
+    dest_type = "FGDB" if ".gdb" in str(tbl_p) else "OTHER"
     df_san = _sanitize_arr_tbl(table=df_arrow,
-                               template=tbl_p if mode in _EXISTING_TARGET_MODES else None)
+                               template=tbl_p if mode == "append" else None,
+                               dest_type=dest_type)
 
-    if mode in _EXISTING_TARGET_MODES:
+    if mode == "append":
         _append_via_memory(df_san, tbl_p,
-                           copy_tool=lambda src, dst: arcpy.management.CopyRows(in_rows=src, out_table=dst),
-                           delete_first=(mode == "delete_append"))
+                           copy_tool=lambda src, dst: arcpy.management.CopyRows(in_rows=src, out_table=dst))
     else:
-        with arcpy.EnvManager(overwriteOutput= (mode == "overwrite")):
+        with arcpy.EnvManager(overwriteOutput=(mode == "overwrite")):
             arcpy.management.CopyRows(in_rows=df_san, out_table=tbl_p)
 
     return tbl if tbl is not None else tbl_p
+
+def gdf_geomtypes_consistent(gdf: gpd.GeoDataFrame):
+    """Ensure all geometries are the same type (borrowed from gpd.overlay())
+    """
+
+    poly_check = gdf.geom_type.isin(POLYGON_GEOM_TYPES).any()
+    lines_check = gdf.geom_type.isin(LINE_GEOM_TYPES).any()
+    points_check = gdf.geom_type.isin(POINT_GEOM_TYPES).any()
+    if sum([poly_check, lines_check, points_check]) > 1:
+        raise ValueError(f"GeoDataFrame has mixed geometry types, arcpy will drop rows with one or the other")
+
+def gdf_geoms_nonnull(gdf: gpd.GeoDataFrame):
+    """Ensure all geometries are nonnull
+    """
+
+    if gdf.geometry.isna().any():
+        raise ValueError(f"GeoDataFrame has rows with Null geometries, arcpy will drop these rows")
+
 
 def gdf_to_fc(gdf: "gpd.GeoDataFrame",
              fc: str|Path|CatalogPath|None = None,
@@ -522,22 +553,21 @@ def gdf_to_fc(gdf: "gpd.GeoDataFrame",
         gdf: A GeoPandas GeoDataFrame
         fc: Destination path. Accepts a string, ``Path``, ``CatalogPath``, or
             ``None`` to write to a new in-memory workspace path.
-        mode: ``"new"`` creates the feature class (errors if it exists),
-            ``"overwrite"`` drops and recreates it, ``"append"`` adds rows to an
-            existing one, ``"delete_append"`` deletes an existing feature class's rows
-            and then appends, keeping its schema, domains, privileges and versioning.
+        mode: ``"new"`` creates the feature class (errors if it exists), ``"overwrite"``
+            drops and recreates it, ``"append"`` adds rows to an existing one.
+            Rows are never deleted from an existing feature class: replacing them atomically is up to the caller.
 
     Raises:
         TypeError: :attr:`gdf` is not a GeoDataFrame.
-        ValueError: :attr:`mode` is not one of the allowed values.
+        ValueError: :attr:`mode` is not one of the allowed values, or, for ``"append"``,
+            the data would be lost or changed by the existing feature class.
         FileExistsError: :attr:`mode` is ``"new"`` but :attr:`fc` already exists.
-        FileNotFoundError: :attr:`mode` is ``"append"`` or ``"delete_append"`` but :attr:`fc`
-            does not exist, or :attr:`fc` is a new ``CatalogPath`` whose dataset or workspace does not exist.
-        RuntimeError: ``"delete_append"`` could not delete rows due to versioning or editor configuration.
+        FileNotFoundError: :attr:`mode` is ``"append"`` but :attr:`fc` does not exist, or
+            :attr:`fc` is a new ``CatalogPath`` whose dataset or workspace does not exist.
 
     Warns:
         UserWarning: Columns in :attr:`gdf` with no matching field in an existing
-            :attr:`fc` are not written (``"append"`` and ``"delete_append"``).
+            :attr:`fc` are not written (``"append"``).
 
     Returns:
         :attr:`fc` exactly as passed, or the new in-memory path string when
@@ -549,10 +579,11 @@ def gdf_to_fc(gdf: "gpd.GeoDataFrame",
     shape_col = None
 
     if isinstance(gdf, gpd.GeoDataFrame):
+        gdf_geomtypes_consistent(gdf)
+        gdf_geoms_nonnull(gdf)
         shape_col = str(gdf.geometry.name)
         _raw = gdf.to_arrow(geometry_encoding="WKB", index = False)
-        # Newer geopandas returns a wrapper, not a pa.Table.  Any Arrow-compatible
-        # object supports __arrow_c_stream__, so we round-trip through that.
+        # Newer geopandas returns a wrapper, not a pa.Table.  
         if not isinstance(_raw, pa.Table):
             _raw = pa.RecordBatchReader.from_stream(_raw).read_all()
         df_arrow = _raw
@@ -560,40 +591,25 @@ def gdf_to_fc(gdf: "gpd.GeoDataFrame",
     else:
         raise TypeError("gdf must be a geopandas GeoDataFrame. Use df_to_tbl() for non-spatial dataframes.")
 
-    if fc is None:
-        fc_p = memory_str()
-        target_exists = False
-    elif isinstance(fc, CatalogPath):
-        fc_p = str(fc.path)
-        target_exists = fc.exists()
-        if mode not in _EXISTING_TARGET_MODES and not target_exists:
-            fc.assert_parent_exists()
-    else:
-        fc_p = str(fc)
-        target_exists = arcpy.Exists(fc_p)
+    fc_p = _resolve_target(fc, mode)
 
-    if mode in _EXISTING_TARGET_MODES and not target_exists:
-        raise FileNotFoundError(f"Cannot use mode='{mode}': target does not exist: {fc_p}")
+    dest_type = "FGDB" if ".gdb" in str(fc_p) else "OTHER"
 
-    # Appending validates the data against the existing feature class before anything is staged or deleted
+    # Appending validates the data against the existing feature class before anything is staged or written
     df_san = _sanitize_arr_tbl(table=df_arrow, shape_col=shape_col, sr=sr,
-                               template=fc_p if mode in _EXISTING_TARGET_MODES else None)
+                               template = (fc_p if mode == "append" else None),
+                               dest_type = dest_type
+                               
+                               )
 
-    if mode in _EXISTING_TARGET_MODES:
+    if mode == "append":
         _append_via_memory(df_san, fc_p,
-                           copy_tool=lambda src, dst: arcpy.management.CopyFeatures(in_features=src, out_feature_class=dst),
-                           delete_first=(mode == "delete_append"))
+                           copy_tool=lambda src, dst: arcpy.management.CopyFeatures(in_features=src, out_feature_class=dst))
     else:
-        if mode == "new" and target_exists:
-            raise FileExistsError(f"Cannot create fc with mode='new': target already exists: {fc_p}")
-
         with arcpy.EnvManager(overwriteOutput=(mode == "overwrite")):
             arcpy.management.CopyFeatures(in_features=df_san, out_feature_class=fc_p)
 
     return fc if fc is not None else fc_p
-
-
-
 
 def _resolve_tbl(tbl: str|Path|CatalogPath, 
                  check_dtype: str = "FeatureClass") -> tuple[list[str], str]:
@@ -757,13 +773,12 @@ def fc_to_gdf(fc: str|Path|CatalogPath,
         field_names: Subset of fields to fetch. Fetches all fields if ``None``.
             The geometry column is always included.
         where_clause: SQL where clause to filter rows. No filter if ``None``.
-        allow_null_geometries: If ``True``, warn on null/invalid geometries instead
-            of raising. Covers missing values and shapes unparseable by shapely.
+        allow_null_geometries: If ``True``, warn on null/invalid geometries instead of raising.
         shape_col: Name of the geometry column. Auto-detected from :attr:`fc` when
             an ``CatalogPath`` is passed; defaults to ``"Shape"`` otherwise.
         fallback_crs: CRS to use when the feature class spatial reference
             has no resolvable factory code (e.g. an improperly defined CRS).
-        to_crs: If provided, reproject the result to this CRS.
+        to_crs: Optionally return a gdf reprojected to this crs
 
     Raises:
         FileNotFoundError: :attr:`fc` does not exist.

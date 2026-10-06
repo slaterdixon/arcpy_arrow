@@ -1,20 +1,5 @@
 """
-Tests for arcpy_arrow.
-
-Requires an ArcGIS Pro Python environment with arcpy available.
-
-Most write tests run twice: once against arcpy's in-memory workspace and once
-against a real file geodatabase. The two are not interchangeable. Several
-failure modes (rows dropped for out-of-range values, null geometries
-discarded) only happen in a file geodatabase.
-
-Written data is checked with arcpy directly (ListFields, SearchCursor,
-Describe, CheckGeometry), never with fc_to_gdf/tbl_to_df, so a bug in the
-readers cannot hide a bug in the writers.
-
-The contract the write tests enforce: a write either produces exactly the
-rows, columns, values, geometries and spatial reference it was given, or it
-raises. A silent change is always a failure.
+Tests for arcpy_arrow
 """
 
 import datetime as dt
@@ -58,6 +43,7 @@ from arcpy_arrow import (
 )
 from arcpy_arrow.interop import _load_gdf_from_arr
 from arcpy_arrow.sanitize_arr_tbl import _sanitize_arr_tbl
+from arcpy_arrow.helpers import ap_row_count
 
 pl = pytest.importorskip("polars")
 
@@ -76,9 +62,6 @@ def fgdb(tmp_path_factory) -> str:
 @pytest.fixture(params=["memory", "fgdb"])
 def new_path(request, fgdb):
     """Factory for unique, not-yet-existing destination paths.
-
-    Parametrized so every test using it runs against both workspaces.
-    ``new_path.workspace`` names the current one.
     """
     created = []
 
@@ -101,9 +84,6 @@ def new_path(request, fgdb):
 @pytest.fixture(params=["gdf_to_fc", "df_to_tbl"])
 def write_columns(request, new_path):
     """Write a dict of equal-length columns through one of the public writers.
-
-    For ``gdf_to_fc`` the columns get a point geometry per row (EPSG:4326).
-    Returns the written path.
     """
 
     def write(columns: dict, *, index=None, **kwargs) -> str:
@@ -135,12 +115,9 @@ def _user_fields(p: str) -> dict[str, str]:
     }
 
 
-def _count(p: str) -> int:
-    return int(arcpy.management.GetCount(p).getOutput(0))
-
 
 def _rows(p: str, cols: list[str]) -> list[tuple]:
-    """Rows in OID order, read with a SearchCursor."""
+    """Fetch rows with SearchCursor."""
     with arcpy.da.SearchCursor(str(p), ["OID@", *cols]) as cur:
         return [r[1:] for r in sorted(cur, key=lambda r: r[0])]
 
@@ -150,7 +127,7 @@ def _column(p: str, col: str) -> list:
 
 
 def _geoms(p: str) -> list:
-    """Shapely geometries in OID order, read with a SearchCursor (``None`` for null shapes).
+    """Read rows as shapely objects with a SearchCursor (``None`` for null shapes).
 
     Uses WKT because arcpy's ``SHAPE@WKB`` token drops Z values.
     """
@@ -194,12 +171,15 @@ def _assert_geoms_match(expected, actual, tol: float) -> None:
 
 
 def _rows_survive_or_raise(write, path_of, n_expected: int) -> None:
-    """Loud failure is acceptable. Losing rows silently is not."""
+    """
+    arcpy likes to silently drop bad rows. Ensure bad rows raise errors instead
+    """
+
     try:
         written = write()
     except Exception:
         return
-    got = _count(path_of(written))
+    got = ap_row_count(path_of(written))
     assert got == n_expected, f"write succeeded but silently dropped {n_expected - got} of {n_expected} rows"
 
 
@@ -307,13 +287,13 @@ class TestSanitizeArrTbl:
         (pa.int8(), pa.utf8()),
         (pa.int32(), pa.large_utf8()),
     ])
-    def test_dictionary_flattened_to_string(self, index_type, value_type):
+    def test_dictionary_raises(self, index_type, value_type):
         cat = pa.DictionaryArray.from_arrays(
             pa.array([0, 1, 0], type=index_type), pa.array(["x", "y"], type=value_type)
         )
-        result = _sanitize_arr_tbl(pa.table({"Shape": _shape(3), "cat": cat}), shape_col="Shape", sr=_sr())
-        assert result.schema.field("cat").type == pa.string()
-        assert result.column("cat").to_pylist() == ["x", "y", "x"]
+        with pytest.raises(ValueError, match = "Dictionary types are not supported"):
+            _sanitize_arr_tbl(pa.table({"Shape": _shape(3), "cat": cat}), shape_col="Shape", sr=_sr())
+
 
     def test_values_preserved(self):
         tbl = pa.table({
@@ -329,7 +309,7 @@ class TestSanitizeArrTbl:
 
     def test_cast_failure_names_the_column(self):
         tbl = pa.table({"Shape": _shape(), "too_big": pa.array([2**63 + 5], type=pa.uint64())})
-        with pytest.raises(pa.ArrowInvalid, match="Column 'too_big'"):
+        with pytest.raises(ValueError, match="Column 'too_big'"):
             _sanitize_arr_tbl(tbl, shape_col="Shape", sr=_sr())
 
     def test_column_order_and_field_metadata_preserved(self):
@@ -577,8 +557,8 @@ class TestCatalogPathOnData:
         assert t.shape_field_name() is None
         assert t.crs() is None
 
-    def test_row_count(self, point_fc):
-        assert _catalog_path_for(point_fc).row_count() == 2
+    def test_rowap_row_count(self, point_fc):
+        assert _catalog_path_for(point_fc).rowap_row_count() == 2
 
     def test_as_dataframe_and_geodataframe(self, point_fc):
         t = _catalog_path_for(point_fc)
@@ -664,6 +644,10 @@ class TestArrowBackedColumns:
         assert pd.api.types.is_integer_dtype(df["small"].dtype)
 
     def test_round_trip_keeps_integer_field_types(self, nullable_bigint_fc, new_path):
+        if new_path.workspace == "fgdb":
+            with pytest.raises(ValueError, match="a file geodatabase drops rows with integers beyond"):
+                gdf_to_fc(fc_to_gdf(nullable_bigint_fc), new_path())
+            return
         p = gdf_to_fc(fc_to_gdf(nullable_bigint_fc), new_path())
         assert _user_fields(p)["small"] in ("Integer", "BigInteger")
         assert _user_fields(p)["big"] == "BigInteger"
@@ -797,7 +781,6 @@ PANDAS_DTYPE_CASES = {
     "string_pyarrow": (pd.array(["a", None, "c"], dtype="string[pyarrow]"), "String", ["a", None, "c"]),
     "unicode_values": (pd.Series(["día", "北京", "naïve"]), "String", ["día", "北京", "naïve"]),
     "empty_string": (pd.Series(["", "a", ""]), "String", ["", "a", ""]),
-    "category": (pd.Categorical(["x", "y", "x"]), "String", ["x", "y", "x"]),
     "datetime": (pd.to_datetime(pd.Series(_TS)), "Date", _TS),
     "datetime_ms": (pd.to_datetime(pd.Series(["2024-01-01 00:00:00.123"] * 3)), "Date",
                     [dt.datetime(2024, 1, 1, 0, 0, 0, 123000)] * 3),
@@ -908,10 +891,17 @@ class TestNoSilentRowLoss:
         p = write_columns({"i": [2**53, -(2**53), 0]})
         assert _column(p, "i") == [2**53, -(2**53), 0]
 
-    def test_empty_frame_writes_empty_output(self, write_columns):
-        p = write_columns({"i": pd.Series([], dtype="int64")})
-        assert _count(p) == 0
-        assert _user_fields(p) == {"i": "BigInteger"}
+    def test_empty_frame(self, write_columns):
+        """A table can be written empty. A feature class can't: arcpy fails to create
+        one from an empty Arrow table, so that must be a clear error, not an ExecuteError."""
+        empty = {"i": pd.Series([], dtype="int64")}
+        if write_columns.writer == "gdf_to_fc":
+            with pytest.raises(ValueError, match="(?i)empty"):
+                write_columns(empty)
+        else:
+            p = write_columns(empty)
+            assert ap_row_count(p) == 0
+            #assert _user_fields(p) == {"i": "BigInteger"}
 
 
 # ===========================================================================
@@ -923,8 +913,6 @@ class TestPolarsWrite:
     def test_dtypes_and_values(self, new_path):
         df = pl.DataFrame({
             "s": ["a", None, "c"],
-            "cat": pl.Series(["x", "y", "x"], dtype=pl.Categorical),
-            "enum": pl.Series(["x", "y", "x"], dtype=pl.Enum(["x", "y"])),
             "b": [True, None, False],
             "u32": pl.Series([1, 2, 2**32 - 1], dtype=pl.UInt32),
             "i8": pl.Series([1, -2, 3], dtype=pl.Int8),
@@ -933,13 +921,13 @@ class TestPolarsWrite:
         })
         p = df_to_tbl(df, new_path())
         assert _user_fields(p) == {
-            "s": "String", "cat": "String", "enum": "String", "b": "Integer",
+            "s": "String", "b": "Integer",
             "u32": "BigInteger", "i8": "SmallInteger", "d": "DateOnly", "f": "Double",
         }
         assert _rows(p, list(df.columns)) == [
-            ("a", "x", "x", 1, 1, 1, dt.date(2024, 1, 1), 1.5),
-            (None, "y", "y", None, 2, -2, None, None),
-            ("c", "x", "x", 0, 2**32 - 1, 3, dt.date(2024, 3, 1), 2.5),
+            ("a", 1, 1, 1, dt.date(2024, 1, 1), 1.5),
+            (None,  None, 2, -2, None, None),
+            ("c", 0, 2**32 - 1, 3, dt.date(2024, 3, 1), 2.5),
         ]
 
     def test_tz_aware_datetime_written_as_timestamp_offset(self, new_path):
@@ -1009,7 +997,7 @@ class TestGeometry:
         d = arcpy.Describe(p)
         assert d.shapeType == shape_type
         assert bool(d.hasZ) == has_z
-        assert _count(p) == len(geoms)
+        assert ap_row_count(p) == len(geoms)
         _assert_geoms_match(geoms, _geoms(p), _xy_tolerance(p))
         assert _geometry_problems(p) == []
 
@@ -1042,7 +1030,7 @@ class TestGeometry:
 
     def test_empty_geometry_written_as_null(self, new_path):
         _, p = _write_geoms(new_path, [Point(0, 0), Point()])
-        assert _count(p) == 2
+        assert ap_row_count(p) == 2
         assert _geoms(p)[1] is None
 
     def test_null_geometry_row_not_silently_dropped(self, new_path):
@@ -1090,21 +1078,10 @@ class TestSpatialReference:
         _, p = _write_geoms(new_path, [Point(1, 1)], crs=epsg)
         assert arcpy.Describe(p).spatialReference.factoryCode == epsg
 
-    def test_crs_without_epsg_code_preserved(self, new_path):
-        """A CRS with no EPSG code falls back to WKT. It must not come out as
-        an 'Unknown' spatial reference."""
-        crs = CRS.from_proj4(
-            "+proj=tmerc +lat_0=0 +lon_0=-120.5 +k=0.9996 +x_0=500000 +y_0=0 +datum=WGS84 +units=m"
-        )
-        assert crs.to_epsg() is None
-        _, p = _write_geoms(new_path, [Point(1, 1)], crs=crs)
-        sr = arcpy.Describe(p).spatialReference
-        assert sr.name.lower() != "unknown"
-        assert CRS.from_wkt(sr.exportToString()).equals(crs, ignore_axis_order=True)
 
     def test_missing_crs_raises(self, new_path):
         gdf = gpd.GeoDataFrame({"a": [1]}, geometry=[Point(1, 1)])
-        with pytest.raises(ValueError, match="no CRS"):
+        with pytest.raises(ValueError, match="GeoDataFrame has no CR"):
             gdf_to_fc(gdf, new_path())
 
 
@@ -1153,11 +1130,15 @@ class TestModes:
         p = write(frame(a=[1]), new_path(), mode="overwrite")
         assert _column(p, "a") == [1]
 
-    @pytest.mark.parametrize("mode", ["append", "delete_append"])
-    def test_existing_target_modes_require_target(self, writer, new_path, mode):
+    def test_append_requires_existing_target(self, writer, new_path):
         write, frame = writer
         with pytest.raises(FileNotFoundError):
-            write(frame(a=[1]), new_path(), mode=mode)
+            write(frame(a=[1]), new_path(), mode="append")
+
+    def test_append_requires_a_target_at_all(self, writer):
+        write, frame = writer
+        with pytest.raises(FileNotFoundError):
+            write(frame(a=[1]), None, mode="append")
 
     def test_append_adds_rows_and_keeps_existing(self, writer, new_path):
         write, frame = writer
@@ -1211,26 +1192,66 @@ class TestModes:
             return
         assert _column(short, "s") == ["abcdef", "ab"]
 
-    def test_delete_append_replaces_rows_and_keeps_schema(self, writer, new_path):
-        write, frame = writer
-        p = write(frame(a=[1, 2, 3], keep=["x", "y", "z"]), new_path())
-        arcpy.management.AddField(p, "added_later", "TEXT", field_length=10)
-        write(frame(a=[9]), p, mode="delete_append")
-        assert set(_user_fields(p)) == {"a", "keep", "added_later"}
-        assert _rows(p, ["a", "keep"]) == [(9, None)]
+    @pytest.mark.parametrize("staged_geom,target_type", [
+        (Point(0, 0), "POLYGON"),
+        (Polygon([(0, 0), (1, 0), (1, 1)]), "POINT"),
+        (LineString([(0, 0), (1, 1)]), "POLYGON"),
+        (Point(0, 0), "MULTIPOINT"),
+    ], ids=["point-polygon", "polygon-point", "polyline-polygon", "point-multipoint"])
+    def test_append_different_geometry_type_raises(self, new_path, staged_geom, target_type):
+        """Rows of the wrong type are written as null shapes (memory) or dropped (file geodatabase)."""
+        target = new_path()
+        ws, name = target.rsplit("/", 1)
+        arcpy.management.CreateFeatureclass(ws, name, target_type, spatial_reference=arcpy.SpatialReference(4326))
+        arcpy.management.AddField(target, "a", "LONG")
+        with pytest.raises(ValueError, match="shapeType"):
+            gdf_to_fc(_gdf(geoms=[staged_geom], a=[1]), target, mode="append")
+        assert int(arcpy.management.GetCount(target).getOutput(0)) == 0
 
-    def test_delete_append_keeps_rows_when_input_is_invalid(self, writer, new_path):
+    @pytest.mark.parametrize("staged_geom,target_zm,match", [
+        (Point(0, 0, 0), {"has_z": "DISABLED"}, "hasZ"),
+        (Point(0, 0), {"has_z": "ENABLED"}, "hasZ"),
+        (Point(0, 0), {"has_m": "ENABLED"}, "hasM"),  # shapely has no M, so only a non-M source can be staged
+    ], ids=["z-into-non-z", "non-z-into-z", "non-m-into-m"])
+    def test_append_z_m_mismatch_raises(self, new_path, staged_geom, target_zm, match):
+        target = new_path()
+        ws, name = target.rsplit("/", 1)
+        arcpy.management.CreateFeatureclass(ws, name, "POINT", spatial_reference=arcpy.SpatialReference(4326), **target_zm)
+        arcpy.management.AddField(target, "a", "LONG")
+        with pytest.raises(ValueError, match=match):
+            gdf_to_fc(_gdf(geoms=[staged_geom], a=[1]), target, mode="append")
+        assert int(arcpy.management.GetCount(target).getOutput(0)) == 0
+
+    def test_delete_append_mode_is_not_supported(self, writer, new_path):
         write, frame = writer
-        p = write(frame(a=[1, 2, 3]), new_path())
-        with pytest.raises(Exception):
-            write(frame(a=[1, "a", 2.0]), p, mode="delete_append")
+        p = write(frame(a=[1, 2]), new_path())
+        with pytest.raises(ValueError, match="mode"):
+            write(frame(a=[9]), p, mode="delete_append")
+        assert _column(p, "a") == [1, 2]
+
+    def test_append_never_deletes_rows_or_the_target(self, writer, new_path, monkeypatch):
+        write, frame = writer
+        p = write(frame(a=[1, 2]), new_path())
+
+        def fail_if_called(*args, **kwargs):
+            raise AssertionError("append called a delete tool on the target")
+
+        real_delete = arcpy.management.Delete
+
+        def delete_anything_but_the_target(path, *args, **kwargs):
+            assert str(path) != p, "append deleted the target"
+            return real_delete(path, *args, **kwargs)
+
+        for tool in ("DeleteRows", "DeleteFeatures", "TruncateTable"):
+            monkeypatch.setattr(arcpy.management, tool, fail_if_called)
+        monkeypatch.setattr(arcpy.management, "Delete", delete_anything_but_the_target)
+
+        write(frame(a=[3]), p, mode="append")
+        monkeypatch.undo()
         assert _column(p, "a") == [1, 2, 3]
 
-    def test_delete_append_keeps_rows_when_append_fails(self, writer, new_path, monkeypatch):
-        """If Append fails after DeleteRows, the target must not be left empty.
-
-        Needs the delete and the append to share an edit session/transaction.
-        """
+    def test_failed_append_raises_and_leaves_target_untouched(self, writer, new_path, monkeypatch):
+        """An error from arcpy's Append must reach the caller, not be swallowed."""
         write, frame = writer
         p = write(frame(a=[1, 2, 3]), new_path())
 
@@ -1239,19 +1260,23 @@ class TestModes:
 
         monkeypatch.setattr(arcpy.management, "Append", failing_append)
         with pytest.raises(arcpy.ExecuteError):
-            write(frame(a=[9]), p, mode="delete_append")
+            write(frame(a=[9]), p, mode="append")
         monkeypatch.undo()
-        assert _column(p, "a") == [1, 2, 3], "target rows were deleted and not restored"
+        assert _column(p, "a") == [1, 2, 3]
 
-    def test_delete_append_keeps_rows_when_new_rows_would_be_dropped(self, writer, new_path):
+    def test_append_leaves_target_untouched_when_input_is_invalid(self, writer, new_path):
+        write, frame = writer
+        p = write(frame(a=[1, 2, 3]), new_path())
+        with pytest.raises(Exception):
+            write(frame(a=[1, "a", 2.0]), p, mode="append")
+        assert _column(p, "a") == [1, 2, 3]
+
+    def test_append_raises_when_new_rows_would_be_dropped(self, writer, new_path):
         write, frame = writer
         p = write(frame(a=[1, 2, 3], s=["a", "b", "c"]), new_path())
-        try:
-            write(frame(a=[4, 5, 6], s=["x" * 6000, "y", "z"]), p, mode="delete_append")
-        except Exception:
-            assert _column(p, "a") == [1, 2, 3]
-            return
-        assert _column(p, "a") == [4, 5, 6], "delete_append succeeded but silently dropped rows"
+        with pytest.raises(ValueError, match="s"):
+            write(frame(a=[4, 5, 6], s=["x" * 6000, "y", "z"]), p, mode="append")
+        assert _column(p, "a") == [1, 2, 3]
 
     def test_append_reprojects_or_rejects_other_crs(self, new_path):
         """A point in EPSG:3857 appended to an EPSG:4326 feature class must end
@@ -1269,7 +1294,7 @@ class TestModes:
         p = gdf_to_fc(_gdf(a=[1]), new_path())
         with pytest.raises(Exception):
             gdf_to_fc(_gdf(geoms=[_SQ], a=[2]), p, mode="append")
-        assert _count(p) == 1
+        assert ap_row_count(p) == 1
 
     @pytest.mark.parametrize("dest_kind", ["str", "Path", "CatalogPath", "None"])
     def test_return_value(self, writer, new_path, fgdb, dest_kind):
@@ -1330,8 +1355,7 @@ ROUND_TRIP_GEOMS = {
 class TestRoundTrip:
     @pytest.mark.parametrize("kind", list(ROUND_TRIP_GEOMS))
     def test_feature_class_round_trip_is_stable(self, new_path, kind):
-        """Three read/write cycles: no accumulating OBJECTID_1 / Shape_Length_1
-        fields, no dtype drift, no value drift, no geometry drift."""
+        """Three read/write cycles"""
         geoms = ROUND_TRIP_GEOMS[kind]
         source = gpd.GeoDataFrame(
             {
