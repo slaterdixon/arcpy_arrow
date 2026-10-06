@@ -16,3 +16,10 @@ def ap_field_names(p: str|Path) -> list[str]:
 
 def ap_row_count(p: str|Path) -> int:
     return int(arcpy.GetCount_management(str(p)).getOutput(0))
+
+
+def ap_shapetype(p: str|Path) -> str|None:
+
+    d = arcpy.Describe(str(p))
+
+    return d.shapeType if hasattr(d, "shapeType") else None
