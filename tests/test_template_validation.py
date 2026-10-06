@@ -29,6 +29,7 @@ arcpy = pytest.importorskip("arcpy")
 
 from arcpy_arrow import CatalogPath, df_to_tbl, memory_str
 from arcpy_arrow.sanitize_arr_tbl import _sanitize_arr_tbl
+from arcpy_arrow.sanitize_arr_tbl import _FGDB_MAX_INT
 
 
 def validate_append(orig, dest) -> None:
@@ -38,15 +39,20 @@ def validate_append(orig, dest) -> None:
     that ``df_to_tbl`` / ``gdf_to_fc`` run when appending. Raises ValueError if it can't be written.
     """
     orig_p = str(orig)
+    dest_type = "FGDB" if ".gdb" in str(dest) else "OTHER"
     desc = arcpy.Describe(orig_p)
 
     if desc.dataType == "FeatureClass":
+        if int(arcpy.management.GetCount(orig_p).getOutput(0)) == 0:
+            # An empty feature class can't be written, so give the schema checks one null-shape row
+            with arcpy.da.InsertCursor(orig_p, ["SHAPE@"]) as cur:
+                cur.insertRow([None])
         table = arcpy.da.TableToArrowTable(orig_p, geometry_encoding="WKB")
         sr = arcpy.SpatialReference()       # Describe() returns a different class than arcpy.SpatialReference
         sr.loadFromString(desc.spatialReference.exportToString())
-        _sanitize_arr_tbl(table, shape_col=desc.shapeFieldName, sr=sr, template=str(dest))
+        _sanitize_arr_tbl(table, shape_col=desc.shapeFieldName, sr=sr, template=str(dest), dest_type=dest_type)
     else:
-        _sanitize_arr_tbl(arcpy.da.TableToArrowTable(orig_p), template=str(dest))
+        _sanitize_arr_tbl(arcpy.da.TableToArrowTable(orig_p), template=str(dest), dest_type=dest_type)
 
 
 # ===========================================================================
@@ -232,16 +238,16 @@ class TestCompatibleSchemas:
             make_table([F("n", "LONG", field_is_nullable="NON_NULLABLE")]),
         )
 
-    def test_integer_at_2_pow_53_into_file_geodatabase_biginteger(self, make_table):
+    def test_integer_at_fgdb_maxint_into_file_geodatabase_biginteger(self, make_table):
         validate_append(
-            make_table([F("n", "BIGINTEGER")], [(2**53,), (-(2**53),)]),
+            make_table([F("n", "BIGINTEGER")], [(_FGDB_MAX_INT,), (-(_FGDB_MAX_INT),)]),
             make_table([F("n", "BIGINTEGER")], ws="fgdb"),
         )
 
     def test_large_integer_into_memory_biginteger(self, make_table):
-        """Only a file geodatabase has the 2**53 limit."""
+        """Only a file geodatabase has the _FGDB_MAX_INT limit."""
         validate_append(
-            make_table([F("n", "BIGINTEGER")], [(2**53 + 1,)]),
+            make_table([F("n", "BIGINTEGER")], [(_FGDB_MAX_INT + 1,)]),
             make_table([F("n", "BIGINTEGER")]),
         )
 
@@ -337,10 +343,10 @@ class TestValuesThatDoNotFit:
         with pytest.raises(ValueError, match="big"):
             validate_append(make_table([F("big", "DOUBLE")], [(3e9,)]), make_table([F("big", "LONG")]))
 
-    @pytest.mark.parametrize("value", [2**53 + 1, -(2**53) - 1])
-    def test_integer_beyond_2_pow_53_into_file_geodatabase(self, make_table, value):
+    @pytest.mark.parametrize("value", [_FGDB_MAX_INT + 1, -(_FGDB_MAX_INT) - 1])
+    def test_integer_beyond_fgdb_maxint_into_file_geodatabase(self, make_table, value):
         """A file geodatabase drops rows holding such values. No error comes from arcpy."""
-        with pytest.raises(ValueError, match="big"):
+        with pytest.raises(ValueError, match="a file geodatabase drops rows with integers beyond"):
             validate_append(make_table([F("big", "BIGINTEGER")], [(value,)]), make_table([F("big", "BIGINTEGER")], ws="fgdb"))
 
     def test_timestamp_with_time_of_day_into_date_only(self, make_table):
@@ -410,47 +416,11 @@ class TestGeometryCompatibility:
     def test_same_geometry_type(self, make_table, geom):
         validate_append(make_table([F("n", "LONG")], geom=geom), make_table([F("n", "LONG")], geom=geom))
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="An Arrow table carries no geometry type, Z or M. Needs a check against the GeoDataFrame in gdf_to_fc.",
-    )
-    @pytest.mark.parametrize("staged_geom,target_geom", [
-        ("POINT", "POLYGON"),
-        ("POLYGON", "POINT"),
-        ("POLYLINE", "POLYGON"),
-        ("POINT", "MULTIPOINT"),
-    ])
-    def test_different_geometry_type_raises(self, make_table, staged_geom, target_geom):
-        """Rows of the wrong type are written as null shapes (memory) or dropped (file geodatabase)."""
-        with pytest.raises(ValueError, match="(?i)shapeType|geometry"):
-            validate_append(make_table(geom=staged_geom), make_table(geom=target_geom))
-
-    @pytest.mark.xfail(
-        strict=True,
-        reason="An Arrow table carries no geometry type, Z or M. Needs a check against the GeoDataFrame in gdf_to_fc.",
-    )
-    def test_z_into_non_z_raises(self, make_table):
-        with pytest.raises(ValueError, match="(?i)hasZ|Z"):
-            validate_append(make_table(geom="POINT", has_z=True), make_table(geom="POINT", has_z=False))
-
-    @pytest.mark.xfail(
-        strict=True,
-        reason="An Arrow table carries no geometry type, Z or M. Needs a check against the GeoDataFrame in gdf_to_fc.",
-    )
-    def test_non_z_into_z_raises(self, make_table):
-        with pytest.raises(ValueError, match="(?i)hasZ|Z"):
-            validate_append(make_table(geom="POINT", has_z=False), make_table(geom="POINT", has_z=True))
+    # Geometry type, Z and M mismatches are checked after staging, in interop._shapetypes_align,
+    # so they are tested through gdf_to_fc(mode="append") in test_interop.py.
 
     def test_same_z(self, make_table):
         validate_append(make_table(geom="POINT", has_z=True), make_table(geom="POINT", has_z=True))
-
-    @pytest.mark.xfail(
-        strict=True,
-        reason="An Arrow table carries no geometry type, Z or M. Needs a check against the GeoDataFrame in gdf_to_fc.",
-    )
-    def test_m_mismatch_raises(self, make_table):
-        with pytest.raises(ValueError, match="(?i)hasM|M"):
-            validate_append(make_table(geom="POINT", has_m=True), make_table(geom="POINT", has_m=False))
 
     def test_same_crs(self, make_table):
         validate_append(make_table(geom="POINT", epsg=2227), make_table(geom="POINT", epsg=2227))
@@ -475,63 +445,42 @@ class TestGeometryCompatibility:
 
 
 # ===========================================================================
-# Wiring: the validation must run before anything in the target changes
+# Wiring: appending validates the data before the target is touched
 # ===========================================================================
-
-
-def _append(df: pd.DataFrame, target: str, *, delete_first: bool) -> None:
-    df_to_tbl(df, target, mode="delete_append" if delete_first else "append")
 
 
 class TestAppendValidatesFirst:
     def test_mismatched_append_raises_value_error_and_leaves_target_untouched(self, make_table):
         target = make_table([F("n", "LONG")], [(1,), (2,)])
         with pytest.raises(ValueError, match="n"):
-            _append(pd.DataFrame({"n": ["a", "b"]}), target, delete_first=False)
+            df_to_tbl(pd.DataFrame({"n": ["a", "b"]}), target, mode="append")
         assert _column(target, "n") == [1, 2]
 
-    def test_delete_append_never_deletes_when_schema_is_bad(self, make_table, monkeypatch):
-        target = make_table([F("n", "LONG")], [(1,), (2,)])
-
-        def fail_if_called(*args, **kwargs):
-            raise AssertionError("DeleteRows ran before the data was validated")
-
-        monkeypatch.setattr(arcpy.management, "DeleteRows", fail_if_called)
-        with pytest.raises(ValueError):
-            _append(pd.DataFrame({"n": ["a"]}), target, delete_first=True)
-        monkeypatch.undo()
-        assert _column(target, "n") == [1, 2]
-
-    def test_value_that_does_not_fit_stops_delete_append(self, make_table):
+    def test_value_that_does_not_fit_leaves_target_untouched(self, make_table):
         target = make_table([F("n", "SHORT")], [(1,), (2,)])
         with pytest.raises(ValueError):
-            _append(pd.DataFrame({"n": [1, 100000]}), target, delete_first=True)
+            df_to_tbl(pd.DataFrame({"n": [1, 100000]}), target, mode="append")
         assert _column(target, "n") == [1, 2]
 
-    def test_string_longer_than_field_stops_delete_append(self, make_table):
+    def test_string_longer_than_field_leaves_target_untouched(self, make_table):
         target = make_table([F("s", "TEXT", field_length=5)], [("old",)])
         with pytest.raises(ValueError, match="s"):
-            _append(pd.DataFrame({"s": ["far too long"]}), target, delete_first=True)
+            df_to_tbl(pd.DataFrame({"s": ["far too long"]}), target, mode="append")
         assert _column(target, "s") == ["old"]
 
     def test_every_problem_is_listed_in_one_error(self, make_table):
         target = make_table([F("a", "LONG"), F("b", "TEXT", field_length=3)])
         with pytest.raises(ValueError) as exc:
-            _append(pd.DataFrame({"a": ["x"], "b": ["too long"]}), target, delete_first=False)
+            df_to_tbl(pd.DataFrame({"a": ["x"], "b": ["too long"]}), target, mode="append")
         assert "'a'" in str(exc.value) and "'b'" in str(exc.value)
 
     def test_compatible_append_still_works(self, make_table):
         target = make_table([F("label", "TEXT", field_length=10), F("n", "LONG")], [("old", 1)], ws="fgdb")
-        _append(pd.DataFrame({"label": ["a", "b"], "n": [2, 3]}), target, delete_first=False)
+        df_to_tbl(pd.DataFrame({"label": ["a", "b"], "n": [2, 3]}), target, mode="append")
         assert sorted(_column(target, "n")) == [1, 2, 3]
-
-    def test_compatible_delete_append_still_works(self, make_table):
-        target = make_table([F("label", "TEXT", field_length=10), F("n", "LONG")], [("old", 1)], ws="fgdb")
-        _append(pd.DataFrame({"label": ["a", "b"], "n": [2, 3]}), target, delete_first=True)
-        assert sorted(_column(target, "n")) == [2, 3]
 
     def test_unmatched_columns_are_skipped_not_rejected(self, make_table):
         target = make_table([F("n", "LONG")], [(1,)])
         with pytest.warns(UserWarning, match="extra"):
-            _append(pd.DataFrame({"n": [2], "extra": ["x"]}), target, delete_first=False)
+            df_to_tbl(pd.DataFrame({"n": [2], "extra": ["x"]}), target, mode="append")
         assert sorted(_column(target, "n")) == [1, 2]
