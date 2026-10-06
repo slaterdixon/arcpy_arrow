@@ -23,3 +23,10 @@ def ap_shapetype(p: str|Path) -> str|None:
     d = arcpy.Describe(str(p))
 
     return d.shapeType if hasattr(d, "shapeType") else None
+
+
+def ap_has_zm(p: str|Path) -> tuple[bool, bool]:
+
+    d = arcpy.Describe(str(p))
+
+    return bool(getattr(d, "hasZ", False)), bool(getattr(d, "hasM", False))
