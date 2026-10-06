@@ -4,6 +4,7 @@ import arcpy
 from arcpy import SpatialReference
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 
 from arcpy_arrow.helpers import ap_workspace, ap_fields
@@ -19,15 +20,16 @@ _UINT_TO_SINT = {
 # File geodatabase drops rows with BigInteger fields>+-2**53
 _FGDB_MAX_INT = 2**53
 
+# CopyRows and similar will choose a default length of 5000 when building new 
+# tables from Arrow objects
+ARCPY_DEFAULT_TBL_STR_LENGTH = 5000
+
 ### Template validation ####################################
 @dataclass
 class DestField():
     name : str
     field_arcpy: arcpy.Field
     field_pyarrow: pa.Field
-
-
-
 
 def _field_metadata(field: pa.Field) -> dict[str, str]:
 
@@ -76,7 +78,9 @@ _ALLOWED_CASTS = {
 
 
 _BAD_PA_TYPES = [
+        (pa.types.is_nested, "Nested types are not supported"),
         (pa.types.is_list, "List types are not supported"),
+        (pa.types.is_dictionary, "Dictionary types are not supported"),
         (pa.types.is_duration, "Duration types are not supported"),
         (pa.types.is_null, "All-null columns are not supported"),
         (pa.types.is_decimal, "Decimal types are not supported")
@@ -125,7 +129,6 @@ def _longest_str(column: pa.ChunkedArray) -> int:
 def arr_compare_fields(column: pa.ChunkedArray,
                        orig_field: pa.Field,
                        dest_field: DestField,
-                       input_is_fgdb: bool = False
                     ) -> list[str]:
     """
     Validate problems loading :attr:`column` into :attr:`dest_field`. 
@@ -144,12 +147,6 @@ def arr_compare_fields(column: pa.ChunkedArray,
     elif orig_kind in ("int", "float") and dest_kind in ("int", "float"):
         if not is_pa_safecast(column, dest_field.field_pyarrow.type):
             problems.append(f"{cast_label}:  pyarrow can not cast these types without overflow or rounding")
-
-        elif input_is_fgdb and orig_kind == "int" and dest_field.field_pyarrow.type == pa.int64():
-            limits = pc.min_max(column).as_py()
-            if limits["min"] is not None and (limits["min"] < -_FGDB_MAX_INT or limits["max"] > _FGDB_MAX_INT):
-                problems.append(f"{cast_label}: a file geodatabase drops rows with integers beyond +-2**53 "
-                                f"(got {limits['min']} to {limits['max']})")
 
     # Would this cast drop time info in a timestamp?
     elif (orig_kind, dest_kind) == ("timestamp", "date") and not _all_midnight(column):
@@ -264,11 +261,8 @@ def _validate_against_template(table: pa.Table,
     """
 
     template_p = str(template)
-
     workspace = str(ap_workspace(template_p))
-    input_is_fgdb = workspace.lower().endswith(".gdb")
 
-    
     dest_fields, dest_schema = get_dest_fields(template_p)
 
     orig_geom = _geometry_field(table.schema)
@@ -291,8 +285,8 @@ def _validate_against_template(table: pa.Table,
         if dest_field is not None:
             problems += arr_compare_fields(column = table.column(idx), 
                                            orig_field=orig_field, 
-                                           dest_field=dest_field, 
-                                           input_is_fgdb = input_is_fgdb)
+                                           dest_field=dest_field
+                                          )
 
     if problems:
         raise ValueError(f"The data can not be written to {template_p}:\n  - " + "\n  - ".join(problems))
@@ -300,7 +294,7 @@ def _validate_against_template(table: pa.Table,
 def _pa_fieldtype_supported(field: pa.Field):
 
     for is_func, message in _BAD_PA_TYPES:
-        if is_func(field):
+        if is_func(field.type):
             raise ValueError(f"Problem with field '{field.name}': {message}",
                              "Drop or cast this column before calling.")
 
@@ -308,11 +302,16 @@ def _pa_fieldname_isascii(field: pa.Field):
     if not field.name.isascii():
         raise ValueError(f"Problem with field '{field.name}': Field names must contain ASCII characters only.")
 
+def _pa_colvals_notinf(col: pa.ChunkedArray, field: pa.Field):
+    if pa.types.is_floating(col.type) and pc.any(pc.is_inf(col)).as_py():
+        raise ValueError(f"Problem with field '{field.name}': Infinite values are not supported, arcpy will drop these rows.")
+
     
 def _sanitize_arr_tbl(table: pa.Table,
                       shape_col:str | None  = None,
                       sr:SpatialReference | None = None,
-                      template:Path|str|None = None
+                      template:Path|str|None = None,
+                      dest_type: Literal["FGDB", "OTHER"] = "OTHER"
                       ) -> pa.Table:
     """
     Sanitize an Arrow table for use with ``arcpy.management.CopyRows()``, ``CopyFeatures()``, and ``Append()``.
@@ -351,6 +350,8 @@ def _sanitize_arr_tbl(table: pa.Table,
         raise ValueError(f"Geometry column '{shape_col}' passed but no spatial reference provided")
     if sr is not None and not isinstance(sr, SpatialReference):
         raise TypeError("Invalid spatial reference argument")
+    if table.num_rows == 0 and shape_col is not None:
+        raise ValueError(f"Empty tables are not supported in Feature Classes")
     
     fields = []
     columns = []
@@ -359,11 +360,27 @@ def _sanitize_arr_tbl(table: pa.Table,
 
     for i, field in enumerate(table.schema):
 
-
-        _pa_fieldname_isascii(table)
-        _pa_fieldtype_supported(field)
-
         column = table.column(i)
+
+        _pa_fieldname_isascii(field)
+        _pa_fieldtype_supported(field)
+        _pa_colvals_notinf(column, field)
+
+        if template is None and (pa.types.is_string(field.type) or pa.types.is_large_string(field.type)):    
+            longest_str = _longest_str(column)
+            if longest_str > ARCPY_DEFAULT_TBL_STR_LENGTH:
+                raise ValueError(
+                    f"Column '{field.name}': longest value is {longest_str} characters, but arcpy will drop rows"
+                    f"over {ARCPY_DEFAULT_TBL_STR_LENGTH} characters. "
+                    f"Truncate the values yourself (e.g. df['{field.name}'].str.slice(0, {ARCPY_DEFAULT_TBL_STR_LENGTH})), or create the table "
+                    "with a wider TEXT field and Append into that."
+                )
+        if dest_type == "FGDB" and pa.types.is_integer(field.type):
+            limits = pc.min_max(column).as_py()
+            if limits["min"] is not None and (limits["min"] < -_FGDB_MAX_INT or limits["max"] > _FGDB_MAX_INT):
+                raise ValueError(f"Column '{field.name}': a file geodatabase drops rows with integers beyond +-{_FGDB_MAX_INT}"
+                                    f"(got {limits['min']} to {limits['max']})")
+
 
         if field.name == "OBJECTID":
             new_field = pa.field(
