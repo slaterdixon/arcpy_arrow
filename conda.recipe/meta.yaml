@@ -5,8 +5,9 @@ package:
   version: {{ version }}
 
 source:
-  url: https://github.com/slaterdixon/arcpy_arrow/archive/refs/tags/v{{ version }}.tar.gz
-  sha256: <fill in>
+  git_url: https://github.com/slaterdixon/arcpy_arrow.git
+  git_rev: v{{ version }}
+
 
 build:
   number: 0
@@ -22,7 +23,7 @@ requirements:
     - python >=3.11
     - shapely
     - geopandas
-    # arcpy, pandas, pyarrow come from arcgispro-py3; checked at import time
+    # arcpy, pandas, pyarrow come from default ESRI conda env.
 
 test:
   requires:
@@ -32,7 +33,7 @@ test:
 
 about:
   home: https://github.com/slaterdixon/arcpy_arrow
-  summary: Arrow-based helpers for moving data between ArcPy and dataframes
+  summary: Arrow-based helpers for roundtripping ArcGIS data with Python dataframes
   license: MIT
   license_file: LICENSE.md
 
