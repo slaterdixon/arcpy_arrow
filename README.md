@@ -53,7 +53,7 @@ conda activate <your env> && conda install -c esri pyarrow=22.0.0
 ```
 
 ### pip
-Alternative, install using pip. Mixing pip and conda installations is generally not a good idea, but may be required in some cases where the ArcGIS Pro environment is too fiddly. 
+Alternatively, install from source using pip. Mixing pip and conda installations is generally not a good idea, but may be required in some cases where the ArcGIS Pro environment is too fiddly. 
 
 ```{cmd}
 python -m pip install --no-deps git+https://github.com/slaterdixon/arcpy_arrow.git@v0.1.0
