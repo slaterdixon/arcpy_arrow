@@ -20,16 +20,46 @@ Leave the world of Field Mappings, Join/Calc, and UpdateCursors behind, without 
 * A conda environment [cloned](https://doc.esri.com/en/arcgis-pro/latest/arcpy/get-started/clone-an-environment.html) from `arcgispro-py3`
 
 ## Installation
+
+The easiest way to install `arcpy_arrow` is into a bare environment with just `arcpy`, `geopandas`, and `shapely`
+
 ```{cmd}
-conda activate <your env> 
-conda install shapely geopandas
-conda install -c conda-forge arcpy_arrow
+conda create -n <your env> arcpy            # Create an environment with the arcpy package
+conda install -c esri geopandas             # Install dependencies from esri channel
+conda install molassesbath::arcpy_arrow     # Install arcpy_arrow
 ```
 
 To work with `polars` DataFrames, also install:
+
 ```{cmd}
 conda install polars
 ```
+
+
+If importing `arcpy_arrow` raises a DLL error for a requirement like `pyarrow`,
+check if the package version matches the version in `arcgispro-py3`
+
+```{cmd}
+conda activate arcgispro-py3 && conda list pyarrow
+
+> # Name                    Version                   Build  Channel
+> pyarrow                   22.0.0                  py313_0    esri
+```
+
+If the version number is different, reinstall the correct version from the esri channel. 
+
+```{cmd}
+conda activate <your env> && conda install -c esri pyarrow=22.0.0
+```
+
+### pip
+Alternative, install using pip. Mixing pip and conda installations is generally not a good idea, but may be required in some cases where the ArcGIS Pro environment is too fiddly. 
+
+```{cmd}
+python -m pip install --no-deps git+https://github.com/slaterdixon/arcpy_arrow.git@v0.1.0
+
+```
+
 ## Quick Start
 ### Interop
 To get started, fetch a Feature Class as a GeoDataFrame:
